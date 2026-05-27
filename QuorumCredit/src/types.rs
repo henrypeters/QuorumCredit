@@ -267,6 +267,35 @@ pub struct TokenConfig {
     pub slash_bps: i128,
 }
 
+// ── #649 Loan Subordination ───────────────────────────────────────────────────
+
+/// Priority level for loan subordination (senior loans are repaid first on default).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LoanPriority {
+    Senior,        // Repaid first in liquidation
+    Subordinated,  // Repaid after senior obligations
+}
+
+// ── #648 Milestone-Based Disbursement ────────────────────────────────────────
+
+/// Status of an individual disbursement milestone.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MilestoneStatus {
+    Pending,   // Not yet released
+    Released,  // Funds disbursed for this milestone
+}
+
+/// A single milestone in a tranche-based disbursement schedule.
+#[contracttype]
+#[derive(Clone)]
+pub struct Milestone {
+    pub amount: i128,              // tranche amount in stroops
+    pub release_timestamp: u64,   // earliest timestamp this tranche can be released
+    pub status: MilestoneStatus,
+}
+
 // ── Data Types ────────────────────────────────────────────────────────────────
 
 #[contracttype]
