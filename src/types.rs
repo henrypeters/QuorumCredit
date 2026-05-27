@@ -69,6 +69,12 @@ pub const DECREASE_STAKE_TIMELOCK: u64 = 7 * 24 * 60 * 60;
 /// Withdrawal request timelock delay, in seconds (24 hours).
 pub const WITHDRAWAL_TIMELOCK_DELAY: u64 = 24 * 60 * 60;
 
+/// Penalty applied to partial mid-loan withdrawals, in basis points (1000 = 10%).
+pub const PARTIAL_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
+
+/// Maximum fraction of stake that can be partially withdrawn during an active loan (50%).
+pub const PARTIAL_WITHDRAWAL_MAX_BPS: i128 = 5_000;
+
 // ── Loan Extension ────────────────────────────────────────────────────────────
 
 /// A pending loan extension request. Created by the borrower; approved by vouchers.
@@ -167,26 +173,10 @@ pub enum DataKey {
     LoanExtension(Address),
     /// Issue #598: loan_id → Vec<PaymentRecord> (payment history)
     PaymentHistory(u64),
-    /// Oracle contract address authorised to push credit scores
-    OracleAddress,
-    /// borrower → ExternalCreditScore (score + timestamp from oracle)
-    ExternalCreditScore(Address),
-}
-
-// ── Oracle Credit Score ───────────────────────────────────────────────────────
-
-/// External credit score fetched from an oracle.
-/// Score range: 0–1000 (mirrors common credit bureau scales).
-/// Used as a factor in yield-rate adjustment at loan request time.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExternalCreditScore {
-    /// Normalised score in the range 0–1000.
-    pub score: u32,
-    /// Ledger timestamp when this score was last written by the oracle.
-    pub updated_at: u64,
-    /// The oracle contract that provided this score.
-    pub oracle: Address,
+    /// Voucher cumulative reputation stats: voucher → VoucherStats
+    VoucherStats(Address),
+    /// Withdrawal queue: borrower → Vec<QueuedWithdrawal>
+    WithdrawalQueue(Address),
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
@@ -373,6 +363,23 @@ pub struct WithdrawalRequest {
     pub borrower: Address,
     pub token: Address,
     pub requested_at: u64,
+}
+
+/// A queued withdrawal request submitted during an active loan.
+/// Processed automatically when the loan is repaid or slashed.
+#[contracttype]
+#[derive(Clone)]
+pub struct QueuedWithdrawal {
+    /// The voucher requesting withdrawal.
+    pub voucher: Address,
+    /// Token the stake is denominated in.
+    pub token: Address,
+    /// Ledger timestamp when the request was submitted.
+    pub requested_at: u64,
+    /// Whether this is a partial withdrawal (up to 50% of stake with penalty).
+    pub partial: bool,
+    /// Priority fee paid by the voucher (in stroops), distributed to remaining vouchers.
+    pub priority_fee: i128,
 }
 
 #[contracttype]

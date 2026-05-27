@@ -51,8 +51,10 @@ pub enum ContractError {
     InsuranceClaimAlreadyMade = 44,
     /// Basis points value is invalid (must be 0–10000).
     InvalidBps = 45,
-    /// Caller is not the registered oracle address.
-    OracleUnauthorized = 49,
-    /// Credit score value is out of the valid range (0–1000).
-    InvalidCreditScore = 50,
+    /// Withdrawal request already queued for this voucher/borrower pair.
+    WithdrawalAlreadyQueued = 46,
+    /// No queued withdrawal found for this voucher/borrower pair.
+    WithdrawalNotQueued = 47,
+    /// Partial withdrawal amount exceeds the 50% cap.
+    PartialWithdrawalExceedsCap = 48,
 }

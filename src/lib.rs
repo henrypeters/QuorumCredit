@@ -6,15 +6,15 @@ mod oracle;
 mod types;
 mod vouch;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, String, Vec};
 
 #[cfg(test)]
-mod oracle_credit_score_test;
+mod withdrawal_queue_test;
 
 use crate::errors::ContractError;
 use crate::helpers::{config, get_active_loan_record, has_active_loan, require_allowed_token, require_not_paused};
 use crate::types::{
-    Config, DataKey, ExternalCreditScore, LoanRecord, LoanStatus, VouchRecord,
+    Config, DataKey, LoanRecord, LoanStatus, QueuedWithdrawal, VouchRecord,
     DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS,
     DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_MIN_VOUCH_AGE_SECS, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS,
 };
@@ -82,6 +82,16 @@ impl QuorumCreditContract {
         vouch::vouch(env, voucher, borrower, stake, token)
     }
 
+    pub fn batch_vouch(
+        env: Env,
+        voucher: Address,
+        borrowers: Vec<Address>,
+        stakes: Vec<i128>,
+        token: Address,
+    ) -> Result<(), ContractError> {
+        vouch::batch_vouch(env, voucher, borrowers, stakes, token)
+    }
+
     // ─────────────────────────────────────────────
     // Stake Management
     // ─────────────────────────────────────────────
@@ -95,43 +105,60 @@ impl QuorumCreditContract {
         vouch::increase_stake(env, voucher, borrower, additional)
     }
 
-    // ─────────────────────────────────────────────
-    // Oracle Credit Score
-    // ─────────────────────────────────────────────
-
-    /// Register (or update) the trusted oracle contract address. Admin-only.
-    pub fn set_oracle(
+    /// Decrease stake. If borrower has an active loan, queues the withdrawal.
+    pub fn decrease_stake(
         env: Env,
-        admin_signers: Vec<Address>,
-        oracle: Address,
-    ) -> Result<(), ContractError> {
-        oracle::set_oracle(env, admin_signers, oracle)
-    }
-
-    /// Called by the registered oracle to push an external credit score for a borrower.
-    /// `score` must be in range 0–1000.
-    pub fn update_credit_score_from_oracle(
-        env: Env,
-        oracle: Address,
+        voucher: Address,
         borrower: Address,
-        score: u32,
+        amount: i128,
     ) -> Result<(), ContractError> {
-        oracle::update_credit_score_from_oracle(env, oracle, borrower, score)
+        vouch::decrease_stake(env, voucher, borrower, amount)
     }
 
-    /// Returns the stored external credit score for a borrower, or `None` if not set.
-    pub fn get_external_credit_score(
+    /// Fully withdraw a vouch. If borrower has an active loan, queues the withdrawal.
+    pub fn withdraw_vouch(
         env: Env,
+        voucher: Address,
         borrower: Address,
-    ) -> Option<ExternalCreditScore> {
-        oracle::get_external_credit_score(env, borrower)
+    ) -> Result<(), ContractError> {
+        vouch::withdraw_vouch(env, voucher, borrower)
     }
 
     // ─────────────────────────────────────────────
-    // Loans
+    // Withdrawal Queue
     // ─────────────────────────────────────────────
 
-    /// Request a loan. Yield rate is adjusted by the borrower's oracle credit score.
+    /// Queue a withdrawal during an active loan.
+    /// Optionally pay a priority fee (stroops) to be processed before others.
+    /// Queue is processed automatically when the loan is repaid or slashed.
+    pub fn request_withdrawal(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        priority_fee: i128,
+    ) -> Result<(), ContractError> {
+        vouch::request_withdrawal(env, voucher, borrower, priority_fee)
+    }
+
+    /// Partial withdrawal: withdraw up to 50% of stake during an active loan.
+    /// A 10% penalty is applied to the withdrawn amount and distributed to remaining vouchers.
+    pub fn partial_withdraw(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+    ) -> Result<(), ContractError> {
+        vouch::partial_withdraw(env, voucher, borrower)
+    }
+
+    /// Get the pending withdrawal queue for a borrower.
+    pub fn get_withdrawal_queue(env: Env, borrower: Address) -> Vec<QueuedWithdrawal> {
+        vouch::get_withdrawal_queue(env, borrower)
+    }
+
+    // ─────────────────────────────────────────────
+    // Loans (minimal — for test support)
+    // ─────────────────────────────────────────────
+
     pub fn request_loan(
         env: Env,
         borrower: Address,
@@ -181,10 +208,7 @@ impl QuorumCreditContract {
             .persistent()
             .set(&DataKey::LoanCounter, &loan_id);
 
-        // Apply oracle credit score adjustment to yield rate
-        let score_adjustment = oracle::credit_score_yield_adjustment(&env, &borrower);
-        let effective_yield_bps = (cfg.yield_bps + score_adjustment).max(0);
-        let total_yield = amount * effective_yield_bps / 10_000;
+        let total_yield = amount * cfg.yield_bps / 10_000;
 
         let loan = LoanRecord {
             id: loan_id,
@@ -222,6 +246,83 @@ impl QuorumCreditContract {
         Ok(())
     }
 
+    pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
+        borrower.require_auth();
+        require_not_paused(&env)?;
+
+        let mut loan = get_active_loan_record(&env, &borrower)?;
+
+        if payment <= 0 {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let total_owed = loan.amount + loan.total_yield;
+        let outstanding = total_owed - loan.amount_repaid;
+
+        if payment > outstanding {
+            return Err(ContractError::InvalidAmount);
+        }
+
+        let token_client = require_allowed_token(&env, &loan.token_address)?;
+        token_client.transfer(&borrower, &env.current_contract_address(), &payment);
+
+        loan.amount_repaid += payment;
+
+        if loan.amount_repaid >= total_owed {
+            loan.status = LoanStatus::Repaid;
+            loan.repayment_timestamp = Some(env.ledger().timestamp());
+
+            let vouches: Vec<VouchRecord> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Vouches(borrower.clone()))
+                .unwrap_or(Vec::new(&env));
+
+            let total_stake: i128 = vouches
+                .iter()
+                .filter(|v| v.token == loan.token_address)
+                .map(|v| v.stake)
+                .sum();
+
+            for v in vouches.iter() {
+                if v.token != loan.token_address {
+                    continue;
+                }
+                let yield_share = if total_stake > 0 {
+                    loan.total_yield * v.stake / total_stake
+                } else {
+                    0
+                };
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &v.voucher,
+                    &(v.stake + yield_share),
+                );
+            }
+
+            // Process any queued withdrawals now that the loan is closed
+            vouch::process_withdrawal_queue(&env, &borrower);
+
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ActiveLoan(borrower.clone()));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::Vouches(borrower.clone()));
+
+            env.events().publish(
+                (symbol_short!("loan"), symbol_short!("repaid")),
+                (borrower.clone(), loan.amount),
+            );
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Loan(loan.id), &loan);
+
+        Ok(())
+    }
+
     pub fn get_loan(env: Env, borrower: Address) -> Option<LoanRecord> {
         let loan_id: u64 = env
             .storage()
@@ -235,5 +336,14 @@ impl QuorumCreditContract {
             .persistent()
             .get(&DataKey::Vouches(borrower))
             .unwrap_or(Vec::new(&env))
+    }
+
+    pub fn vouch_exists(env: Env, voucher: Address, borrower: Address) -> bool {
+        let vouches: Vec<VouchRecord> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vouches(borrower))
+            .unwrap_or(Vec::new(&env));
+        vouches.iter().any(|v| v.voucher == voucher)
     }
 }
