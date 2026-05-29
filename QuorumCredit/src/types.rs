@@ -202,6 +202,90 @@ pub enum DataKey {
     SlashRecord(u64),
 }
 
+// ── Loan Health Monitoring ────────────────────────────────────────────────────
+
+/// Risk level of a loan.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RiskLevel {
+    Healthy,
+    AtRisk,
+    Critical,
+}
+
+/// Health score for an individual active loan.
+#[contracttype]
+#[derive(Clone)]
+pub struct LoanHealthScore {
+    pub borrower: Address,
+    pub loan_id: u64,
+    /// 0–100: higher is healthier.
+    pub score: u32,
+    pub risk_level: RiskLevel,
+    /// Seconds remaining until deadline (0 if past deadline).
+    pub seconds_until_deadline: u64,
+    /// Repayment progress in basis points (0–10_000).
+    pub repayment_progress_bps: u32,
+    /// Borrower historical risk score (0–10_000; higher = riskier).
+    pub borrower_risk_score: i128,
+    /// Voucher concentration: stake held by the single largest voucher in bps.
+    pub top_voucher_concentration_bps: u32,
+}
+
+/// Exposure summary for a single voucher across all active loans.
+#[contracttype]
+#[derive(Clone)]
+pub struct ExposureReport {
+    pub voucher: Address,
+    /// Total stake currently locked in active loans (stroops).
+    pub total_active_stake: i128,
+    /// Number of active loans this voucher is backing.
+    pub active_loan_count: u32,
+    /// Number of those loans that are at-risk or critical.
+    pub at_risk_count: u32,
+}
+
+/// Protocol-wide health summary.
+#[contracttype]
+#[derive(Clone)]
+pub struct ProtocolHealthReport {
+    /// Total number of active loans.
+    pub active_loan_count: u32,
+    /// Number of active loans classified as at-risk or critical.
+    pub at_risk_loan_count: u32,
+    /// Total principal outstanding across all active loans (stroops).
+    pub total_outstanding: i128,
+    /// Total stake locked across all active loans (stroops).
+    pub total_locked_stake: i128,
+    /// Contract token balance (stroops).
+    pub contract_balance: i128,
+}
+
+/// Configurable thresholds for health alert classification.
+#[contracttype]
+#[derive(Clone)]
+pub struct HealthAlertThresholds {
+    /// Seconds before deadline at which a loan is considered at-risk (default: 7 days).
+    pub at_risk_deadline_secs: u64,
+    /// Seconds before deadline at which a loan is considered critical (default: 1 day).
+    pub critical_deadline_secs: u64,
+    /// Repayment progress bps below which a loan is at-risk (default: 2500 = 25%).
+    pub at_risk_repayment_bps: u32,
+    /// Top-voucher concentration bps above which concentration risk is flagged (default: 8000 = 80%).
+    pub concentration_risk_bps: u32,
+}
+
+impl HealthAlertThresholds {
+    pub fn default() -> Self {
+        HealthAlertThresholds {
+            at_risk_deadline_secs: 7 * 24 * 60 * 60,
+            critical_deadline_secs: 24 * 60 * 60,
+            at_risk_repayment_bps: 2500,
+            concentration_risk_bps: 8000,
+        }
+    }
+}
+
 // ── Audit Log ─────────────────────────────────────────────────────────────────
 
 #[contracttype]

@@ -104,6 +104,8 @@ mod default_prediction_test;
 mod admin_delegation_test;
 #[cfg(test)]
 mod governance_veto_test;
+#[cfg(test)]
+mod loan_health_test;
 
 pub use errors::ContractError;
 pub use types::*;
@@ -947,6 +949,41 @@ impl QuorumCreditContract {
 
     pub fn health_check(env: Env) -> health::HealthStatus {
         health::health_check(&env)
+    }
+
+    /// Get the health score for a single active loan.
+    pub fn get_loan_health(env: Env, borrower: Address) -> Option<LoanHealthScore> {
+        health::get_loan_health(env, borrower)
+    }
+
+    /// Get health scores for all active loans that are at-risk or critical.
+    pub fn get_at_risk_loans(env: Env) -> Vec<LoanHealthScore> {
+        health::get_at_risk_loans(env)
+    }
+
+    /// Get the total active stake exposure for a voucher.
+    pub fn get_voucher_exposure(env: Env, voucher: Address) -> ExposureReport {
+        health::get_voucher_exposure(env, voucher)
+    }
+
+    /// Get a protocol-wide health summary.
+    pub fn get_protocol_health(env: Env) -> ProtocolHealthReport {
+        health::get_protocol_health(env)
+    }
+
+    /// Set configurable alert thresholds (admin only).
+    pub fn set_health_alert_thresholds(
+        env: Env,
+        admin_signers: Vec<Address>,
+        thresholds: HealthAlertThresholds,
+    ) {
+        helpers::require_admin_approval(&env, &admin_signers);
+        health::set_alert_thresholds(&env, thresholds);
+    }
+
+    /// Get the current alert thresholds.
+    pub fn get_health_alert_thresholds(env: Env) -> HealthAlertThresholds {
+        health::get_alert_thresholds(&env)
     }
 
     // ── Upgrade Safety ────────────────────────────────────────────────────────
