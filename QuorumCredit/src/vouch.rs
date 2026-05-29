@@ -599,10 +599,20 @@ pub fn total_vouched(env: Env, borrower: Address) -> Result<i128, ContractError>
         .get::<DataKey, Vec<VouchRecord>>(&DataKey::Vouches(borrower))
         .unwrap_or(Vec::new(&env));
 
+    let cfg = crate::helpers::config(&env);
+    let now = env.ledger().timestamp();
+
     let mut total: i128 = 0;
     for vouch in vouches.iter() {
+        let effective = crate::helpers::compute_decayed_stake(
+            vouch.amount,
+            vouch.vouch_timestamp,
+            now,
+            cfg.decay_rate_bps,
+            cfg.decay_period_secs,
+        );
         total = total
-            .checked_add(vouch.amount)
+            .checked_add(effective)
             .ok_or(ContractError::StakeOverflow)?;
     }
 
