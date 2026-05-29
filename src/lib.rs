@@ -8,7 +8,7 @@ mod types;
 mod vouch;
 mod vouch_snapshot;
 
-use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env, String, Vec};
 
 pub use errors::ContractError;
 pub use types::*;
@@ -26,9 +26,7 @@ mod withdrawal_queue_test;
 #[cfg(test)]
 mod cross_chain_vouch_test;
 #[cfg(test)]
-mod dynamic_slash_threshold_test;
-#[cfg(test)]
-mod loan_size_slash_test;
+mod property_stake_loan_invariants_test;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
@@ -77,9 +75,9 @@ impl QuorumCreditContract {
                 voting_period_seconds: DEFAULT_VOTING_PERIOD_SECONDS,
                 slash_cooldown_seconds: 0,
                 emergency_pause_enabled: false,
-                dynamic_slash_threshold: DEFAULT_DYNAMIC_SLASH_THRESHOLD,
-                loan_size_slash_enabled: DEFAULT_LOAN_SIZE_SLASH_ENABLED,
-                loan_size_slash_max_bps: DEFAULT_LOAN_SIZE_SLASH_MAX_BPS,
+                early_repayment_discount_bps: 0,
+                oracle_address: None,
+                slash_delay_seconds: 0,
             },
         );
 
@@ -143,7 +141,10 @@ impl QuorumCreditContract {
         borrower: Address,
         additional: i128,
     ) -> Result<(), ContractError> {
-        vouch::increase_stake(env, voucher, borrower, additional)
+        acquire_lock(&env)?;
+        let result = vouch::increase_stake(env.clone(), voucher, borrower, additional);
+        release_lock(&env);
+        result
     }
 
     pub fn decrease_stake(
@@ -152,7 +153,10 @@ impl QuorumCreditContract {
         borrower: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
-        vouch::decrease_stake(env, voucher, borrower, amount)
+        acquire_lock(&env)?;
+        let result = vouch::decrease_stake(env.clone(), voucher, borrower, amount);
+        release_lock(&env);
+        result
     }
 
     pub fn withdraw_vouch(
@@ -160,7 +164,10 @@ impl QuorumCreditContract {
         voucher: Address,
         borrower: Address,
     ) -> Result<(), ContractError> {
-        vouch::withdraw_vouch(env, voucher, borrower)
+        acquire_lock(&env)?;
+        let result = vouch::withdraw_vouch(env.clone(), voucher, borrower);
+        release_lock(&env);
+        result
     }
 
     pub fn request_withdrawal(
@@ -169,7 +176,10 @@ impl QuorumCreditContract {
         borrower: Address,
         priority_fee: i128,
     ) -> Result<(), ContractError> {
-        vouch::request_withdrawal(env, voucher, borrower, priority_fee)
+        acquire_lock(&env)?;
+        let result = vouch::request_withdrawal(env.clone(), voucher, borrower, priority_fee);
+        release_lock(&env);
+        result
     }
 
     pub fn partial_withdraw(
@@ -177,7 +187,10 @@ impl QuorumCreditContract {
         voucher: Address,
         borrower: Address,
     ) -> Result<(), ContractError> {
-        vouch::partial_withdraw(env, voucher, borrower)
+        acquire_lock(&env)?;
+        let result = vouch::partial_withdraw(env.clone(), voucher, borrower);
+        release_lock(&env);
+        result
     }
 
     pub fn get_withdrawal_queue(env: Env, borrower: Address) -> Vec<QueuedWithdrawal> {
@@ -194,8 +207,10 @@ impl QuorumCreditContract {
     ) -> Result<(), ContractError> {
         borrower.require_auth();
         require_not_paused(&env)?;
+        acquire_lock(&env)?;
 
         if has_active_loan(&env, &borrower) {
+            release_lock(&env);
             return Err(ContractError::ActiveLoanExists);
         }
 
@@ -203,7 +218,13 @@ impl QuorumCreditContract {
         let cfg = config(&env);
 
         if amount < cfg.min_loan_amount {
+            release_lock(&env);
             return Err(ContractError::LoanBelowMinAmount);
+        }
+
+        if amount <= 0 {
+            release_lock(&env);
+            return Err(ContractError::InvalidAmount);
         }
 
         let vouches: Vec<VouchRecord> = env
@@ -219,6 +240,7 @@ impl QuorumCreditContract {
             .sum();
 
         if total_stake < threshold {
+            release_lock(&env);
             return Err(ContractError::InsufficientFunds);
         }
 
@@ -247,6 +269,8 @@ impl QuorumCreditContract {
             maturity_date: None,
             rate_type: crate::types::RateType::Fixed,
             index_reference: None,
+            escrow_status: EscrowStatus::None,
+            retry_count: 0,
         };
 
         env.storage()
@@ -266,17 +290,23 @@ impl QuorumCreditContract {
             (borrower, amount),
         );
 
+        release_lock(&env);
         Ok(())
     }
 
     pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
         borrower.require_auth();
         require_not_paused(&env)?;
+        acquire_lock(&env)?;
 
-        let mut loan = get_active_loan_record(&env, &borrower)?;
+        let mut loan = match get_active_loan_record(&env, &borrower) {
+            Ok(l) => l,
+            Err(e) => { release_lock(&env); return Err(e); }
+        };
 
-        if payment <= 0 {
-            return Err(ContractError::InvalidAmount);
+        if let Err(e) = validate_amount(&env, payment) {
+            release_lock(&env);
+            return Err(e);
         }
 
         let cfg = config(&env);
@@ -292,6 +322,7 @@ impl QuorumCreditContract {
         let outstanding = effective_total_owed - loan.amount_repaid;
 
         if payment > outstanding {
+            release_lock(&env);
             return Err(ContractError::InvalidAmount);
         }
 
@@ -462,7 +493,7 @@ impl QuorumCreditContract {
                 // Issue #634: Liquidity mining reward on top of yield.
                 let cfg = config(&env);
                 let mining_reward = if cfg.liquidity_mining_rate_bps > 0 {
-                    v.stake * cfg.liquidity_mining_rate_bps / 10_000
+                    v.stake * cfg.liquidity_mining_rate_bps as i128 / 10_000
                 } else {
                     0
                 };
@@ -501,7 +532,7 @@ impl QuorumCreditContract {
             }
 
             env.events().publish(
-                (symbol_short!("loan"), symbol_short!("escrow_rej")),
+                (symbol_short!("loan"), symbol_short!("escrw_rej")),
                 (borrower.clone(), escrowed),
             );
         }
@@ -513,6 +544,7 @@ impl QuorumCreditContract {
             .persistent()
             .set(&DataKey::Loan(loan.id), &loan);
 
+        release_lock(&env);
         Ok(())
     }
 
@@ -609,6 +641,10 @@ impl QuorumCreditContract {
 
     pub fn execute_slash_vote(env: Env, borrower: Address) -> Result<(), ContractError> {
         governance::execute_slash_vote(env, borrower)
+    }
+
+    pub fn execute_pending_slash(env: Env, borrower: Address) -> Result<(), ContractError> {
+        governance::execute_pending_slash(env, borrower)
     }
 
     // ── Issue #680: slash threshold governance ────────────────────────────────
