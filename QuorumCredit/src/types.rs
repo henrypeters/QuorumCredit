@@ -202,6 +202,10 @@ pub enum DataKey {
     SlashRecord(u64),
     // #704: Managed derived key storage
     ManagedKey(soroban_sdk::BytesN<32>),
+    // #747: Loan to Equity Conversion
+    EquityConversionTerms(u64), // loan_id → EquityConversionTerms
+    // #748: Cross-Default Configuration
+    CrossDefaultEnabled,        // bool: whether cross-default clause is active
 }
 
 // ── Loan Health Monitoring ────────────────────────────────────────────────────
@@ -377,6 +381,9 @@ pub struct Config {
     /// Period in seconds over which decay_rate_bps is applied.
     /// 0 = decay disabled. E.g. 30 * 24 * 60 * 60 = 30 days.
     pub decay_period_secs: u64,
+    /// #748: Cross-default clause enabled flag.
+    /// When true, default on any loan triggers default on all borrower's loans.
+    pub cross_default_enabled: bool,
 }
 
 // ── Per-Token Config ──────────────────────────────────────────────────────────
@@ -591,3 +598,29 @@ pub struct SlashRecord {
     /// Timestamp when forgiveness was granted (0 if not forgiven).
     pub forgiven_at: u64,
 }
+
+// ── #747: Loan Conversion to Equity ────────────────────────────────────────────
+
+/// Terms for converting a loan into equity stake in borrower's business.
+#[contracttype]
+#[derive(Clone)]
+pub struct EquityConversionTerms {
+    /// Percentage of equity stake borrower grants in exchange for loan forgiveness (0-10000 basis points).
+    pub equity_percentage_bps: u32,
+    /// Timestamp when conversion terms were agreed upon.
+    pub agreed_at: u64,
+    /// Whether the conversion has been executed.
+    pub executed: bool,
+    /// Timestamp of execution (0 if not yet executed).
+    pub executed_at: u64,
+}
+
+/// Storage key extension for conversion terms in LoanRecord.
+#[contracttype]
+pub enum DataKeyExtension {
+    EquityTerms(u64), // loan_id → EquityConversionTerms
+}
+
+// ── #748: Cross-Default Clause ────────────────────────────────────────────────
+
+/// Cross-default enabled flag stored in Config via DataKey.
