@@ -1,6 +1,5 @@
 mod auth;
 mod logging;
-mod rate_limiter;
 mod webhook;
 
 use axum::{
@@ -19,10 +18,6 @@ use tracing_subscriber;
 
 use auth::JwtAuth;
 use logging::RequestLogger;
-use rate_limiter::{
-    InMemoryStore, RateLimitConfig, RateLimiter, RateLimiterState, Tier,
-    rate_limit_middleware,
-};
 use webhook::{WebhookManager, WebhookEvent};
 
 #[derive(Clone)]
@@ -30,7 +25,6 @@ pub struct AppState {
     jwt_auth: Arc<JwtAuth>,
     logger: Arc<RequestLogger>,
     webhook_manager: Arc<WebhookManager>,
-    rate_limiter: RateLimiterState,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +41,7 @@ pub struct AuthResponse {
 pub struct WebhookSubscribeRequest {
     pub url: String,
     pub events: Vec<String>,
+    pub secret: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -56,9 +51,7 @@ pub struct WebhookEventRequest {
 }
 
 async fn logging_middleware(
-async fn logging_middleware(
     State(state): State<AppState>,
-    req: Request<axum::body::Body>,
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
@@ -116,7 +109,7 @@ async fn subscribe_webhook(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     match state
         .webhook_manager
-        .subscribe(payload.url, payload.events)
+        .subscribe(payload.url, payload.events, payload.secret)
         .await
     {
         Ok(sub) => Ok(Json(serde_json::to_value(sub).unwrap())),
@@ -213,41 +206,11 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "default_secret".to_string());
-
-    let tier = match std::env::var("RATE_LIMIT_TIER").as_deref() {
-        Ok("pro") => Tier::Pro,
-        Ok("enterprise") => {
-            let rpm = std::env::var("RATE_LIMIT_RPM").ok().and_then(|v| v.parse().ok()).unwrap_or(5000);
-            let burst = std::env::var("RATE_LIMIT_BURST").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
-            Tier::Enterprise { requests_per_minute: rpm, burst }
-        }
-        _ => Tier::Free,
-    };
-
-    let rl_store: Arc<dyn rate_limiter::RateLimitStore> =
-        if let Ok(redis_url) = std::env::var("REDIS_URL") {
-            match rate_limiter::RedisStore::new(&redis_url) {
-                Ok(store) => {
-                    tracing::info!("Rate limiter using Redis backend");
-                    Arc::new(store)
-                }
-                Err(e) => {
-                    tracing::warn!("Redis unavailable ({}), falling back to in-memory store", e);
-                    Arc::new(InMemoryStore::new())
-                }
-            }
-        } else {
-            tracing::info!("REDIS_URL not set, using in-memory rate limit store");
-            Arc::new(InMemoryStore::new())
-        };
-
-    let rl = RateLimiterState(Arc::new(RateLimiter::new(RateLimitConfig::new(tier), rl_store)));
-
+    
     let state = AppState {
         jwt_auth: Arc::new(JwtAuth::new(jwt_secret)),
         logger: Arc::new(RequestLogger::new()),
         webhook_manager: Arc::new(WebhookManager::new()),
-        rate_limiter: rl.clone(),
     };
 
     let app = Router::new()
@@ -263,7 +226,6 @@ pub async fn run_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
             state.clone(),
             logging_middleware,
         ))
-        .layer(middleware::from_fn_with_state(rl, rate_limit_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -288,19 +250,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rate_limiter::{InMemoryStore, RateLimitConfig, RateLimiter, RateLimiterState, Tier};
 
     #[test]
     fn test_app_state_creation() {
-        let rl = RateLimiterState(Arc::new(RateLimiter::new(
-            RateLimitConfig::new(Tier::Free),
-            Arc::new(InMemoryStore::new()),
-        )));
-        let _state = AppState {
+        let state = AppState {
             jwt_auth: Arc::new(JwtAuth::new("test_secret".to_string())),
             logger: Arc::new(RequestLogger::new()),
             webhook_manager: Arc::new(WebhookManager::new()),
-            rate_limiter: rl,
         };
+
+        assert!(Arc::strong_count(&state.jwt_auth) >= 1);
     }
 }
