@@ -5,6 +5,8 @@ mod rate_limiter;
 mod webhook;
 mod ws;
 mod voucher_history;
+#[cfg(test)]
+mod voucher_history_integration_test;
 
 use axum::{
     extract::{State, Json, WebSocketUpgrade},
