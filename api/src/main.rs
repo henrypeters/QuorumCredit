@@ -3,6 +3,7 @@ mod auth;
 mod logging;
 mod rate_limiter;
 mod voucher_history;
+mod partial_repayment_analytics;
 #[cfg(test)]
 mod voucher_history_integration_test;
 mod webhook;
