@@ -120,7 +120,28 @@ pub enum ContractError {
     CreditScoreNotFound = 114,
     /// Credit score configuration is invalid.
     InvalidCreditConfig = 115,
-    /// A write operation was attempted while the contract is in the Thawing state.
-    /// Only reads and withdrawals are permitted during a thaw period.
-    ContractThawing = 116,
+/// A write operation was attempted while the contract is in the Thawing state.
+/// Only reads and withdrawals are permitted during a thaw period.
+ContractThawing = 116,
+
+/// Syndication not found.
+SyndicationNotFound = 117,
+/// Syndication member not found.
+SyndicationMemberNotFound = 118,
+/// Syndication already has a loan.
+SyndicationHasLoan = 119,
+/// Syndication is not in the correct status.
+InvalidSyndicationStatus = 120,
+/// Syndication member already exists.
+SyndicationMemberExists = 121,
+/// Syndication has insufficient approvals.
+InsufficientSyndicationApprovals = 122,
+/// Syndication has too many members.
+SyndicationMaxMembersExceeded = 123,
+/// Syndication has too few members.
+SyndicationMinMembersNotMet = 124,
+/// Invalid syndication share percentage.
+InvalidSyndicationShare = 125,
+/// Syndication configuration is invalid.
+InvalidSyndicationConfig = 126,
 }
