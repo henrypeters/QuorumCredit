@@ -423,8 +423,19 @@ pub fn decrease_stake(
         return Err(ContractError::InsufficientFunds);
     }
 
-    // If active loan: queue the withdrawal
+    // If active loan: reduce stake immediately and queue the withdrawal
     if has_active_loan(&env, &borrower) {
+        let mut vouches_mut = vouches;
+        if amount == vouch_rec.stake {
+            vouches_mut.remove(idx);
+        } else {
+            let mut updated = vouch_rec.clone();
+            updated.stake = updated.stake.checked_sub(amount).ok_or(ContractError::ArithmeticError)?;
+            vouches_mut.set(idx, updated);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vouches(borrower.clone()), &vouches_mut);
         return queue_withdrawal_internal(&env, voucher, borrower, vouch_rec.token, false, 0);
     }
 
@@ -477,15 +488,21 @@ pub fn withdraw_vouch(
         .ok_or(ContractError::VoucherNotFound)? as u32;
 
     let vouch_rec = vouches.get(idx).unwrap();
+    let vouch_stake = vouch_rec.stake;
+    let vouch_token = vouch_rec.token.clone();
 
-    // If active loan: queue the withdrawal
+    // If active loan: remove vouch and queue the withdrawal
     if has_active_loan(&env, &borrower) {
-        return queue_withdrawal_internal(&env, voucher, borrower, vouch_rec.token, false, 0);
+        let mut vouches_mut = vouches;
+        vouches_mut.remove(idx);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Vouches(borrower.clone()), &vouches_mut);
+        return queue_withdrawal_internal(&env, voucher, borrower, vouch_token, false, 0);
     }
 
     // No active loan: execute immediately
-    let token_client = require_allowed_token(&env, &vouch_rec.token)?;
-    let stake = vouch_rec.stake;
+    let token_client = require_allowed_token(&env, &vouch_token)?;
     let mut vouches_mut = vouches;
     vouches_mut.remove(idx);
 
@@ -493,7 +510,7 @@ pub fn withdraw_vouch(
         .persistent()
         .set(&DataKey::Vouches(borrower.clone()), &vouches_mut);
 
-    token_client.transfer(&env.current_contract_address(), &voucher, &stake);
+    token_client.transfer(&env.current_contract_address(), &voucher, &vouch_stake);
 
     env.events().publish(
         (symbol_short!("vouch"), symbol_short!("withdraw")),
@@ -622,7 +639,9 @@ pub fn partial_withdraw(
 }
 
 /// Process the withdrawal queue for a borrower after loan resolution (repay or slash).
-/// Called internally by the loan module after repay/slash completes.
+/// Called internally by the loan module during repay/slash, BEFORE vouch records are deleted.
+/// For each queued withdrawal, the voucher's stake is transferred back and the vouch record
+/// is removed from the vouches list.
 pub fn process_withdrawal_queue(env: &Env, borrower: &Address) {
     let queue: Vec<QueuedWithdrawal> = env
         .storage()
@@ -634,14 +653,13 @@ pub fn process_withdrawal_queue(env: &Env, borrower: &Address) {
         return;
     }
 
-    let vouches: Vec<VouchRecord> = env
+    let mut vouches: Vec<VouchRecord> = env
         .storage()
         .persistent()
         .get(&DataKey::Vouches(borrower.clone()))
         .unwrap_or(Vec::new(env));
 
     // Sort by priority fee descending (higher fee = processed first)
-    // We do a simple insertion-sort since queue is typically small
     let mut sorted_queue = queue.clone();
     let n = sorted_queue.len();
     for i in 1..n {
@@ -660,48 +678,38 @@ pub fn process_withdrawal_queue(env: &Env, borrower: &Address) {
     // Collect total priority fees to distribute to non-withdrawing vouchers
     let total_priority_fees: i128 = sorted_queue.iter().map(|q| q.priority_fee).sum();
 
-    // Process each queued withdrawal
+    // Track which vouchers have been processed so we can filter them out later
+    let mut processed_vouchers: Vec<Address> = Vec::new(env);
+
+    // Process each queued withdrawal: transfer the stake back to the voucher
     for queued in sorted_queue.iter() {
         let idx_opt = vouches.iter().position(|v| v.voucher == queued.voucher);
-        if let Some(_idx) = idx_opt {
-            // Stake was already zeroed out during slash or will be returned via repay flow.
-            // Emit event so off-chain indexers can track the queue processing.
+        if let Some(idx) = idx_opt {
+            let vouch_rec = vouches.get(idx).unwrap();
+            let token_client = require_allowed_token(env, &vouch_rec.token).ok();
+            if let Some(tc) = token_client {
+                let contract = env.current_contract_address();
+                tc.transfer(&contract, &vouch_rec.voucher, &vouch_rec.stake);
+            }
+            vouches.remove(idx);
+            processed_vouchers.push_back(queued.voucher.clone());
+
             env.events().publish(
                 (symbol_short!("wq"), symbol_short!("processed")),
-                (queued.voucher.clone(), borrower.clone()),
+                (queued.voucher.clone(), borrower.clone(), vouch_rec.stake),
             );
         }
     }
 
     // Distribute priority fees to remaining (non-withdrawing) vouchers
     if total_priority_fees > 0 {
-        let withdrawing_vouchers: Vec<Address> = {
-            let mut v: Vec<Address> = Vec::new(env);
-            for q in sorted_queue.iter() {
-                v.push_back(q.voucher.clone());
-            }
-            v
-        };
-
-        let remaining_vouches: Vec<VouchRecord> = {
-            let mut v: Vec<VouchRecord> = Vec::new(env);
-            for vr in vouches.iter() {
-                let is_withdrawing = withdrawing_vouchers.iter().any(|w| w == vr.voucher);
-                if !is_withdrawing {
-                    v.push_back(vr);
-                }
-            }
-            v
-        };
-
-        let total_remaining_stake: i128 = remaining_vouches.iter().map(|v| v.stake).sum();
+        let total_remaining_stake: i128 = vouches.iter().map(|v| v.stake).sum();
 
         if total_remaining_stake > 0 {
-            // Use the first queued withdrawal's token for fee distribution
             if let Some(first) = sorted_queue.get(0) {
                 if let Ok(token_client) = require_allowed_token(env, &first.token) {
                     let contract = env.current_contract_address();
-                    for vr in remaining_vouches.iter() {
+                    for vr in vouches.iter() {
                         let share = total_priority_fees * vr.stake / total_remaining_stake;
                         if share > 0 {
                             token_client.transfer(&contract, &vr.voucher, &share);
@@ -711,6 +719,11 @@ pub fn process_withdrawal_queue(env: &Env, borrower: &Address) {
             }
         }
     }
+
+    // Update the vouches list (remaining vouchers after queue processing)
+    env.storage()
+        .persistent()
+        .set(&DataKey::Vouches(borrower.clone()), &vouches);
 
     // Clear the queue
     env.storage()
@@ -824,6 +837,7 @@ mod tests {
         client.initialize(&deployer, &admins, &1, &token_id.address());
         (contract_id, token_id.address())
     }
+}
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
@@ -848,37 +862,6 @@ fn queue_withdrawal_internal(
         }
     }
 
-        let (contract_id, token) = setup_contract(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let borrower = Address::generate(&env);
-
-        let voucher1 = Address::generate(&env);
-        let voucher2 = Address::generate(&env);
-
-        let mut vouches = Vec::new(&env);
-        vouches.push_back(VouchRecord {
-            voucher: voucher1,
-            stake: i128::MAX - 1000,
-            vouch_timestamp: 0,
-            token: token.clone(),
-        });
-        vouches.push_back(VouchRecord {
-            voucher: voucher2,
-            stake: 2000,
-            vouch_timestamp: 0,
-            token: token.clone(),
-        });
-
-        env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Vouches(borrower.clone()), &vouches);
-        });
-
-        let result = client.try_total_vouched(&borrower);
-        assert_eq!(result, Err(Ok(ContractError::StakeOverflow)));
-    }
     queue.push_back(QueuedWithdrawal {
         voucher: voucher.clone(),
         token,
@@ -937,146 +920,252 @@ fn distribute_penalty(
 }
 
 pub fn transfer_vouch(
-    _env: Env,
-    _from: Address,
-    _to: Address,
-    _borrower: Address,
-) -> Result<(), ContractError> {
-    Err(ContractError::InvalidStateTransition)
-}
-
-pub fn delegate_vouch(
-    _env: Env,
-    _voucher: Address,
-    _borrower: Address,
-    _delegate: Address,
-    _token: Address,
-) -> Result<(), ContractError> {
-    Err(ContractError::InvalidStateTransition)
-}
-
-pub fn revoke_delegation(
-    _env: Env,
-    _voucher: Address,
-    _borrower: Address,
-    _token: Address,
-) -> Result<(), ContractError> {
-    Err(ContractError::InvalidStateTransition)
-}
-
-        let (contract_id, token) = setup_contract(&env);
-        let client = QuorumCreditContractClient::new(&env, &contract_id);
-
-        let borrower = Address::generate(&env);
-
-        let voucher1 = Address::generate(&env);
-        let voucher2 = Address::generate(&env);
-
-        let mut vouches = Vec::new(&env);
-        vouches.push_back(VouchRecord {
-            voucher: voucher1,
-            stake: 1_000_000,
-            vouch_timestamp: 0,
-            token: token.clone(),
-        });
-        vouches.push_back(VouchRecord {
-            voucher: voucher2,
-            stake: 2_500_000,
-            vouch_timestamp: 0,
-            token: token.clone(),
-        });
-
-        env.as_contract(&contract_id, || {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Vouches(borrower.clone()), &vouches);
-        });
-
-        let result = client.total_vouched(&borrower);
-        assert_eq!(result, 3_500_000);
-    }
-/// Issue #863: Admin grants a one-time emergency cooldown bypass to a voucher.
-/// Supports emergency refinancing where a borrower urgently needs additional
-/// backing before the normal 24-hour cooldown expires.
-pub fn set_emergency_cooldown_bypass(
     env: Env,
-    admin_signers: Vec<Address>,
-    voucher: Address,
-    enabled: bool,
+    from: Address,
+    to: Address,
+    borrower: Address,
 ) -> Result<(), ContractError> {
-    require_admin_approval(&env, &admin_signers);
+    from.require_auth();
+    require_not_thawing(&env)?;
+
+    if from == to {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let mut vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .ok_or(ContractError::NoVouchesForBorrower)?;
+
+    let idx = vouches
+        .iter()
+        .position(|v| v.voucher == from)
+        .ok_or(ContractError::VoucherNotFound)? as u32;
+
+    // Check no duplicate vouch for the target voucher
+    for v in vouches.iter() {
+        if v.voucher == to && v.token == vouches.get(idx).unwrap().token {
+            return Err(ContractError::DuplicateVouch);
+        }
+    }
+
+    // If borrower has an active loan, block transfer
+    if has_active_loan(&env, &borrower) {
+        return Err(ContractError::ActiveLoanExists);
+    }
+
+    let vouch_rec = vouches.get(idx).unwrap();
+    let token = vouch_rec.token.clone();
+
+    // Update the voucher field from `from` to `to`
+    let mut updated = vouch_rec.clone();
+    updated.voucher = to.clone();
+    vouches.set(idx, updated);
+
     env.storage()
         .persistent()
-        .set(&DataKey::EmergencyCooldownBypass(voucher), &enabled);
+        .set(&DataKey::Vouches(borrower.clone()), &vouches);
+
+    // Update VoucherHistory for both addresses
+    let mut from_history: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::VoucherHistory(from.clone()))
+        .unwrap_or(Vec::new(&env));
+    // Remove borrower from from's history if no other vouches remain
+    let has_other_vouch = vouches.iter().any(|v| v.voucher == from);
+    if !has_other_vouch {
+        let pos = from_history.iter().position(|b| b == borrower);
+        if let Some(p) = pos {
+            from_history.remove(p as u32);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::VoucherHistory(from.clone()), &from_history);
+    }
+
+    let mut to_history: Vec<Address> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::VoucherHistory(to.clone()))
+        .unwrap_or(Vec::new(&env));
+    to_history.push_back(borrower.clone());
+    env.storage()
+        .persistent()
+        .set(&DataKey::VoucherHistory(to.clone()), &to_history);
+
+    env.events().publish(
+        (symbol_short!("vouch"), symbol_short!("transfer")),
+        (from, to, borrower, vouch_rec.stake, token),
+    );
+
     Ok(())
 }
 
-/// Issue #863: Query whether an emergency cooldown bypass is active for a voucher.
-pub fn has_emergency_cooldown_bypass(env: Env, voucher: Address) -> bool {
-    env.storage()
-        .persistent()
-        .get(&DataKey::EmergencyCooldownBypass(voucher))
-        .unwrap_or(false)
-}
-
-/// Issue #863: Vouch with emergency cooldown bypass.
-/// Requires a prior admin-granted bypass. The bypass is consumed on success.
-pub fn emergency_vouch(
+pub fn delegate_vouch(
     env: Env,
     voucher: Address,
     borrower: Address,
-    stake: i128,
+    delegate: Address,
     token: Address,
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_thawing(&env)?;
 
-    let bypass_key = DataKey::EmergencyCooldownBypass(voucher.clone());
-    let has_bypass: bool = env
-        .storage()
-        .persistent()
-        .get(&bypass_key)
-        .unwrap_or(false);
-
-    if !has_bypass {
-        return Err(ContractError::EmergencyBypassNotAuthorised);
+    if delegate == voucher {
+        return Err(ContractError::InvalidStateTransition);
     }
 
-    // Consume the bypass before proceeding (single-use, prevents replay).
-    env.storage().persistent().set(&bypass_key, &false);
+    let mut vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .ok_or(ContractError::NoVouchesForBorrower)?;
 
-    let cfg = VouchConfig::load(&env);
-    let cfg_bypass = VouchConfig {
-        whitelist_enabled: cfg.whitelist_enabled,
-        min_stake: cfg.min_stake,
-        vouch_cooldown_secs: 0,
-        max_vouchers_per_borrower: cfg.max_vouchers_per_borrower,
-    };
+    let idx = vouches
+        .iter()
+        .position(|v| v.voucher == voucher && v.token == token)
+        .ok_or(ContractError::VoucherNotFound)? as u32;
 
-    crate::helpers::check_rate_limit(&env, &voucher)?;
-    crate::helpers::register_borrower_if_needed(&env, &borrower);
-    let (token_client, vouches) =
-        validate_vouch(&env, &cfg_bypass, &voucher, &borrower, stake, &token, None)?;
-    commit_vouch(&env, &token_client, voucher, borrower, stake, token, vouches, None)
+    let mut vouch_rec = vouches.get(idx).unwrap();
+    vouch_rec.delegate = Some(delegate.clone());
+    vouches.set(idx, vouch_rec.clone());
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Vouches(borrower.clone()), &vouches);
+
+    // Store delegation lookup
+    env.storage().persistent().set(
+        &DataKey::VouchDelegation(borrower.clone(), voucher.clone(), token.clone()),
+        &delegate,
+    );
+
+    let timestamp = env.ledger().timestamp();
+    let mut vouch_history: Vec<VouchHistoryEntry> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::VouchHistory(borrower.clone(), voucher.clone(), token.clone()))
+        .unwrap_or(Vec::new(&env));
+
+    vouch_history.push_back(VouchHistoryEntry {
+        timestamp,
+        modification_type: soroban_sdk::String::from_str(&env, "delegated"),
+        stake_amount: vouch_rec.stake,
+        delegate: Some(delegate),
+    });
+
+    env.storage().persistent().set(
+        &DataKey::VouchHistory(borrower.clone(), voucher.clone(), token.clone()),
+        &vouch_history,
+    );
+
+    env.events().publish(
+        (symbol_short!("vouch"), symbol_short!("delegate")),
+        (voucher, borrower, delegate),
+    );
+
+    Ok(())
 }
 
-pub fn set_vouch_expiry(
-    _env: Env,
-    _voucher: Address,
-    _borrower: Address,
-    _expiry: u64,
-    _token: Address,
+pub fn revoke_delegation(
+    env: Env,
+    voucher: Address,
+    borrower: Address,
+    token: Address,
 ) -> Result<(), ContractError> {
-    Err(ContractError::InvalidStateTransition)
+    voucher.require_auth();
+    require_not_thawing(&env)?;
+
+    let mut vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .ok_or(ContractError::NoVouchesForBorrower)?;
+
+pub fn set_vouch_expiry(
+    env: Env,
+    voucher: Address,
+    borrower: Address,
+    expiry: u64,
+    token: Address,
+) -> Result<(), ContractError> {
+    voucher.require_auth();
+    require_not_thawing(&env)?;
+
+    let mut vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .ok_or(ContractError::NoVouchesForBorrower)?;
+
+    let idx = vouches
+        .iter()
+        .position(|v| v.voucher == voucher && v.token == token)
+        .ok_or(ContractError::VoucherNotFound)? as u32;
+
+    let mut vouch_rec = vouches.get(idx).unwrap();
+    let now = env.ledger().timestamp();
+
+    if expiry > 0 && expiry <= now {
+        return Err(ContractError::InvalidAmount);
+    }
+
+    let new_expiry = if expiry > 0 { Some(expiry) } else { None };
+    vouch_rec.expiry_timestamp = new_expiry;
+    vouches.set(idx, vouch_rec.clone());
+
+    env.storage()
+        .persistent()
+        .set(&DataKey::Vouches(borrower.clone()), &vouches);
+
+    let modification_type = if expiry > 0 {
+        "expiry_set"
+    } else {
+        "expiry_cleared"
+    };
+
+    let mut vouch_history: Vec<VouchHistoryEntry> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::VouchHistory(
+            borrower.clone(),
+            voucher.clone(),
+            token.clone(),
+        ))
+        .unwrap_or(Vec::new(&env));
+
+    vouch_history.push_back(VouchHistoryEntry {
+        timestamp: now,
+        modification_type: soroban_sdk::String::from_str(&env, modification_type),
+        stake_amount: vouch_rec.stake,
+        delegate: None,
+    });
+
+    env.storage().persistent().set(
+        &DataKey::VouchHistory(borrower.clone(), voucher.clone(), token.clone()),
+        &vouch_history,
+    );
+
+    env.events().publish(
+        (symbol_short!("vouch"), symbol_short!("expiry")),
+        (voucher, borrower, expiry),
+    );
+
+    Ok(())
 }
 
 pub fn get_vouch_history(
     env: Env,
-    _borrower: Address,
-    _voucher: Address,
-    _token: Address,
+    borrower: Address,
+    voucher: Address,
+    token: Address,
 ) -> Vec<crate::types::VouchHistoryEntry> {
-    Vec::new(&env)
+    env.storage()
+        .persistent()
+        .get(&DataKey::VouchHistory(borrower, voucher, token))
+        .unwrap_or(Vec::new(&env))
 }
 
 pub fn vouch_exists(env: Env, voucher: Address, borrower: Address) -> bool {
@@ -1088,8 +1177,11 @@ pub fn vouch_exists(env: Env, voucher: Address, borrower: Address) -> bool {
     vouches.iter().any(|v| v.voucher == voucher)
 }
 
-pub fn voucher_history(env: Env, _voucher: Address) -> Vec<Address> {
-    Vec::new(&env)
+pub fn voucher_history(env: Env, voucher: Address) -> Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::VoucherHistory(voucher))
+        .unwrap_or(Vec::new(&env))
 }
 
 pub fn get_voucher_stats(
@@ -1164,6 +1256,40 @@ pub fn dispute_vouch(
     );
 
     Ok(())
+}
+
+/// Compute the reputation-weighted stake for a vouch.
+/// Vouchers with higher reputation scores get their stake weighted more heavily,
+/// providing them with greater yield and governance influence (Issue #866).
+/// Weight multiplier: 1.0 + (reputation_score * 10 bps), capped at 2.0x (10000 bps).
+pub fn vouch_reputation_weight(env: &Env, voucher: &Address) -> i128 {
+    let rep_score: u32 = env
+        .storage()
+        .persistent()
+        .get::<DataKey, crate::types::VoucherStats>(&DataKey::VoucherStats(voucher.clone()))
+        .map(|s| s.successful_vouches)
+        .unwrap_or(0);
+    // Each successful vouch adds 500 bps (5%) weight, max 10000 bps (100% = 2x)
+    let weight_bps = (rep_score as i128 * 500).min(10_000);
+    BPS_DENOMINATOR + weight_bps
+}
+
+/// Compute the reputation-weighted total stake for a borrower's vouches.
+/// Used in loan eligibility and yield distribution (Issue #866).
+pub fn total_vouched_weighted(env: &Env, borrower: &Address, token: &Address) -> i128 {
+    let vouches: Vec<VouchRecord> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Vouches(borrower.clone()))
+        .unwrap_or(Vec::new(env));
+    let mut total: i128 = 0;
+    for v in vouches.iter() {
+        if v.token == *token {
+            let weight = vouch_reputation_weight(env, &v.voucher);
+            total += v.stake * weight / BPS_DENOMINATOR;
+        }
+    }
+    total
 }
 
 pub fn total_vouched(env: Env, borrower: Address) -> Result<i128, ContractError> {

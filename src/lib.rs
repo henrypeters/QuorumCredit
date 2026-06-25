@@ -129,30 +129,12 @@ impl QuorumCreditContract {
 
     // ── Vouching ──────────────────────────────────────────────────────────────
 
-                min_vouch_age_secs: DEFAULT_MIN_VOUCH_AGE_SECS,
-                prepayment_penalty_bps: 0,
-                liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
-                voting_period_seconds: DEFAULT_VOTING_PERIOD_SECONDS,
-                slash_cooldown_seconds: 0,
-                emergency_pause_enabled: false,
-                early_repayment_discount_bps: 0,
-                oracle_address: None,
-                slash_delay_seconds: 0,
-                successor_admin: None,
-            },
-        );
-
-        Ok(())
-    }
-
     pub fn vouch(
         env: Env,
         voucher: Address,
         borrower: Address,
         stake: i128,
         token: Address,
-    ) -> Result<(), ContractError> {
-        vouch::vouch(env, voucher, borrower, stake, token)
         chain_id: Option<u32>,
     ) -> Result<(), ContractError> {
         vouch::vouch(env, voucher, borrower, stake, token, chain_id)
@@ -205,8 +187,6 @@ impl QuorumCreditContract {
         borrowers: Vec<Address>,
         stakes: Vec<i128>,
         token: Address,
-    ) -> Result<(), ContractError> {
-        vouch::batch_vouch(env, voucher, borrowers, stakes, token)
         chain_id: Option<u32>,
     ) -> Result<(), ContractError> {
         vouch::batch_vouch(env, voucher, borrowers, stakes, token, chain_id)
@@ -219,10 +199,6 @@ impl QuorumCreditContract {
         additional: i128,
     ) -> Result<(), ContractError> {
         vouch::increase_stake(env, voucher, borrower, additional)
-        acquire_lock(&env)?;
-        let result = vouch::increase_stake(env.clone(), voucher, borrower, additional);
-        release_lock(&env);
-        result
     }
 
     pub fn decrease_stake(
@@ -248,7 +224,48 @@ impl QuorumCreditContract {
         to: Address,
         borrower: Address,
     ) -> Result<(), ContractError> {
-        vouch::transfer_vouch(env, from, to, borrower)
+        acquire_lock(&env)?;
+        let result = vouch::transfer_vouch(env.clone(), from, to, borrower);
+        release_lock(&env);
+        result
+    }
+
+    pub fn delegate_vouch(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        delegate: Address,
+        token: Address,
+    ) -> Result<(), ContractError> {
+        acquire_lock(&env)?;
+        let result = vouch::delegate_vouch(env.clone(), voucher, borrower, delegate, token);
+        release_lock(&env);
+        result
+    }
+
+    pub fn revoke_delegation(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        token: Address,
+    ) -> Result<(), ContractError> {
+        acquire_lock(&env)?;
+        let result = vouch::revoke_delegation(env.clone(), voucher, borrower, token);
+        release_lock(&env);
+        result
+    }
+
+    pub fn set_vouch_expiry(
+        env: Env,
+        voucher: Address,
+        borrower: Address,
+        expiry: u64,
+        token: Address,
+    ) -> Result<(), ContractError> {
+        acquire_lock(&env)?;
+        let result = vouch::set_vouch_expiry(env.clone(), voucher, borrower, expiry, token);
+        release_lock(&env);
+        result
     }
 
     // ── Loans ─────────────────────────────────────────────────────────────────
@@ -278,44 +295,6 @@ impl QuorumCreditContract {
             .instance()
             .get(&DataKey::ReferralBonusBps)
             .unwrap_or(DEFAULT_REFERRAL_BONUS_BPS)
-        acquire_lock(&env)?;
-        let result = vouch::decrease_stake(env.clone(), voucher, borrower, amount);
-        release_lock(&env);
-        result
-    }
-
-    pub fn withdraw_vouch(
-        env: Env,
-        voucher: Address,
-        borrower: Address,
-    ) -> Result<(), ContractError> {
-        acquire_lock(&env)?;
-        let result = vouch::withdraw_vouch(env.clone(), voucher, borrower);
-        release_lock(&env);
-        result
-    }
-
-    pub fn request_withdrawal(
-        env: Env,
-        voucher: Address,
-        borrower: Address,
-        priority_fee: i128,
-    ) -> Result<(), ContractError> {
-        acquire_lock(&env)?;
-        let result = vouch::request_withdrawal(env.clone(), voucher, borrower, priority_fee);
-        release_lock(&env);
-        result
-    }
-
-    pub fn partial_withdraw(
-        env: Env,
-        voucher: Address,
-        borrower: Address,
-    ) -> Result<(), ContractError> {
-        acquire_lock(&env)?;
-        let result = vouch::partial_withdraw(env.clone(), voucher, borrower);
-        release_lock(&env);
-        result
     }
 
     pub fn get_withdrawal_queue(env: Env, borrower: Address) -> Vec<QueuedWithdrawal> {
@@ -358,7 +337,7 @@ impl QuorumCreditContract {
         let mut loan = helpers::get_active_loan_record(&env, &borrower)
             .expect("no active loan");
 
-        if loan.repaid || loan.defaulted {
+        if loan.status != LoanStatus::Active {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
 
@@ -369,16 +348,23 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
-        loan.defaulted = true;
+        loan.status = LoanStatus::Defaulted;
         env.storage()
             .persistent()
             .set(&DataKey::Loan(loan.id), &loan);
         env.storage()
             .persistent()
             .remove(&DataKey::ActiveLoan(borrower.clone()));
-        env.storage()
+
+        // Process withdrawal queue before deleting vouches (Issue #865)
+        vouch::process_withdrawal_queue(&env, &borrower);
+
+        // Re-read vouches after queue processing removed queued withdrawals
+        let vouches: Vec<VouchRecord> = env
+            .storage()
             .persistent()
-            .remove(&DataKey::Vouches(borrower.clone()));
+            .get(&DataKey::Vouches(borrower.clone()))
+            .unwrap_or(Vec::new(&env));
 
         let token_client = token::Client::new(&env, &loan.token_address);
         let mut total_slashed: i128 = 0;
@@ -412,150 +398,14 @@ impl QuorumCreditContract {
         {
             ReputationNftExternalClient::new(&env, &nft_addr).burn(&borrower);
         }
-        loan_purpose: String,
-        token_addr: Address,
-    ) -> Result<(), ContractError> {
-        borrower.require_auth();
-        require_not_paused(&env)?;
-        acquire_lock(&env)?;
 
-        if has_active_loan(&env, &borrower) {
-            release_lock(&env);
-            return Err(ContractError::ActiveLoanExists);
-        }
+        // Update credit score after slash
+        let _ = credit_score::update_credit_score(env.clone(), borrower.clone());
 
-        let token_client = require_allowed_token(&env, &token_addr)?;
-        let cfg = config(&env);
-
-        if amount < cfg.min_loan_amount {
-            release_lock(&env);
-            return Err(ContractError::LoanBelowMinAmount);
-        }
-
-        if amount <= 0 {
-            release_lock(&env);
-            return Err(ContractError::InvalidAmount);
-        }
-
-        let vouches: Vec<VouchRecord> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Vouches(borrower.clone()))
-            .unwrap_or(Vec::new(&env));
-
-        let total_stake: i128 = vouches
-            .iter()
-            .filter(|v| v.token == token_addr)
-            .map(|v| v.stake)
-            .sum();
-
-        if total_stake < threshold {
-            release_lock(&env);
-            return Err(ContractError::InsufficientFunds);
-        }
-
-        // #643: Validate loan_purpose against allowed_purposes whitelist (empty = all allowed)
-        if !cfg.allowed_purposes.is_empty() {
-            let purpose_allowed = cfg.allowed_purposes.iter().any(|p| p == loan_purpose);
-            if !purpose_allowed {
-                return Err(ContractError::LoanPurposeNotAllowed);
-            }
-        }
-
-        // #642: Enforce sector diversification — no single sector may contribute > 50% of total stake
-        if total_stake > 0 {
-            let mut sector_names: Vec<soroban_sdk::String> = Vec::new(&env);
-            let mut sector_amounts: Vec<i128> = Vec::new(&env);
-            for v in vouches.iter() {
-                if v.token != token_addr {
-                    continue;
-                }
-                let mut found = false;
-                for i in 0..sector_names.len() {
-                    if sector_names.get(i).unwrap() == v.sector {
-                        let cur = sector_amounts.get(i).unwrap();
-                        sector_amounts.set(i, cur + v.stake);
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    sector_names.push_back(v.sector.clone());
-                    sector_amounts.push_back(v.stake);
-                }
-            }
-            for i in 0..sector_amounts.len() {
-                let s_stake = sector_amounts.get(i).unwrap();
-                if s_stake * 2 > total_stake {
-                    return Err(ContractError::SectorConcentrationTooHigh);
-                }
-            }
-        }
-
-        let now = env.ledger().timestamp();
-        let loan_id = helpers::next_loan_id(&env);
-        let total_yield = amount * cfg.yield_bps / 10_000;
-
-        let loan = LoanRecord {
-            id: loan_id,
-            borrower: borrower.clone(),
-            co_borrowers: Vec::new(&env),
-            amount,
-            amount_repaid: 0,
-            total_yield,
-            status: LoanStatus::Active,
-            created_at: now,
-            disbursement_timestamp: now,
-            repayment_timestamp: None,
-            deadline: now + cfg.loan_duration,
-            loan_purpose,
-            token_address: token_addr.clone(),
-            amortization_schedule: Vec::new(&env),
-            reminder_sent: false,
-            risk_score: 0,
-            deferment_periods: 0,
-            maturity_date: None,
-            rate_type: crate::types::RateType::Fixed,
-            index_reference: None,
-            escrow_status: EscrowStatus::None,
-            retry_count: 0,
-        };
-
+        // Clean up vouches storage last
         env.storage()
             .persistent()
-            .set(&DataKey::Loan(loan_id), &loan);
-        env.storage()
-            .persistent()
-            .set(&DataKey::ActiveLoan(borrower.clone()), &loan_id);
-        env.storage()
-            .persistent()
-            .set(&DataKey::LatestLoan(borrower.clone()), &loan_id);
-
-        // #644: Collect insurance premium from borrower if configured
-        if cfg.insurance_premium_bps > 0 {
-            let premium = amount * cfg.insurance_premium_bps / 10_000;
-            if premium > 0 {
-                token_client.transfer(&borrower, &env.current_contract_address(), &premium);
-                let pool_balance: i128 = env
-                    .storage()
-                    .instance()
-                    .get(&DataKey::InsurancePool)
-                    .unwrap_or(0);
-                env.storage()
-                    .instance()
-                    .set(&DataKey::InsurancePool, &(pool_balance + premium));
-            }
-        }
-
-        token_client.transfer(&env.current_contract_address(), &borrower, &amount);
-
-        env.events().publish(
-            (symbol_short!("loan"), symbol_short!("created")),
-            (borrower, amount),
-        );
-
-        release_lock(&env);
-        Ok(())
+            .remove(&DataKey::Vouches(borrower.clone()));
     }
 
     /// Confirm intent to repay the active loan.
@@ -580,139 +430,6 @@ impl QuorumCreditContract {
             (symbol_short!("loan"), symbol_short!("repay_ok")),
             (borrower, loan.id),
         );
-
-        Ok(())
-    }
-
-    pub fn repay(env: Env, borrower: Address, payment: i128) -> Result<(), ContractError> {
-        borrower.require_auth();
-        require_not_paused(&env)?;
-        acquire_lock(&env)?;
-
-        let mut loan = match get_active_loan_record(&env, &borrower) {
-            Ok(l) => l,
-            Err(e) => { release_lock(&env); return Err(e); }
-        };
-
-        if let Err(e) = validate_amount(&env, payment) {
-            release_lock(&env);
-            return Err(e);
-        }
-
-        let cfg = config(&env);
-
-        // If confirmation_required is enabled, the borrower must have called
-        // confirm_repayment first. The confirmation is keyed by loan_id and
-        // consumed here so it cannot be replayed.
-        if cfg.confirmation_required {
-            let confirmed: bool = env
-                .storage()
-                .persistent()
-                .get(&DataKey::RepaymentConfirmation(loan.id))
-                .unwrap_or(false);
-            if !confirmed {
-                return Err(ContractError::RepaymentNotConfirmed);
-            }
-            // Consume the confirmation — one-time use.
-            env.storage()
-                .persistent()
-                .remove(&DataKey::RepaymentConfirmation(loan.id));
-        }
-
-        let now = env.ledger().timestamp();
-
-        // #668: Apply early repayment discount if repaying before deadline
-        let discount = if now < loan.deadline && cfg.early_repayment_discount_bps > 0 {
-            loan.total_yield * cfg.early_repayment_discount_bps as i128 / 10_000
-        } else {
-            0
-        };
-        let effective_total_owed = loan.amount + loan.total_yield - discount;
-        let outstanding = effective_total_owed - loan.amount_repaid;
-
-        if payment > outstanding {
-            release_lock(&env);
-            return Err(ContractError::InvalidAmount);
-        }
-
-        let token_client = require_allowed_token(&env, &loan.token_address)?;
-        token_client.transfer(&borrower, &env.current_contract_address(), &payment);
-
-        loan.amount_repaid += payment;
-
-        if loan.amount_repaid >= effective_total_owed {
-            // #666/#667: If oracle is configured, hold in escrow pending verification.
-            // Otherwise release immediately.
-            if cfg.oracle_address.is_some() {
-                loan.escrow_status = EscrowStatus::Pending;
-                loan.status = LoanStatus::Active; // stays active until oracle releases
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::EscrowAmount(borrower.clone()), &payment);
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Loan(loan.id), &loan);
-                env.events().publish(
-                    (symbol_short!("loan"), symbol_short!("escrow")),
-                    (borrower, payment),
-                );
-            } else {
-                // No oracle — release immediately
-                loan.status = LoanStatus::Repaid;
-                loan.repayment_timestamp = Some(now);
-                loan.escrow_status = EscrowStatus::Released;
-
-                let vouches: Vec<VouchRecord> = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::Vouches(borrower.clone()))
-                    .unwrap_or(Vec::new(&env));
-
-                let total_stake: i128 = vouches
-                    .iter()
-                    .filter(|v| v.token == loan.token_address)
-                    .map(|v| v.stake)
-                    .sum();
-
-                for v in vouches.iter() {
-                    if v.token != loan.token_address {
-                        continue;
-                    }
-                    let yield_share = if total_stake > 0 {
-                        loan.total_yield * v.stake / total_stake
-                    } else {
-                        0
-                    };
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &v.voucher,
-                        &(v.stake + yield_share),
-                    );
-                }
-
-                vouch::process_withdrawal_queue(&env, &borrower);
-
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::ActiveLoan(borrower.clone()));
-                env.storage()
-                    .persistent()
-                    .remove(&DataKey::Vouches(borrower.clone()));
-
-                env.events().publish(
-                    (symbol_short!("loan"), symbol_short!("repaid")),
-                    (borrower.clone(), loan.amount),
-                );
-
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Loan(loan.id), &loan);
-            }
-        } else {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Loan(loan.id), &loan);
-        }
 
         Ok(())
     }
@@ -814,7 +531,21 @@ impl QuorumCreditContract {
                 );
             }
 
+            // Process withdrawal queue before deleting vouches (Issue #865)
             vouch::process_withdrawal_queue(&env, &borrower);
+
+            // Increment borrower repayment count
+            let prev_count: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::RepaymentCount(borrower.clone()))
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&DataKey::RepaymentCount(borrower.clone()), &(prev_count + 1));
+
+            // Update credit score after successful repayment
+            let _ = credit_score::update_credit_score(env.clone(), borrower.clone());
 
             env.storage()
                 .persistent()
@@ -884,9 +615,16 @@ impl QuorumCreditContract {
         env.storage()
             .persistent()
             .remove(&DataKey::ActiveLoan(borrower.clone()));
-        env.storage()
+
+        // Process withdrawal queue before deleting vouches (Issue #865)
+        vouch::process_withdrawal_queue(&env, &borrower);
+
+        // Re-read vouches after queue processing
+        let vouches: Vec<VouchRecord> = env
+            .storage()
             .persistent()
-            .remove(&DataKey::Vouches(borrower.clone()));
+            .get(&DataKey::Vouches(borrower.clone()))
+            .unwrap_or(Vec::new(&env));
 
         let token_client = token::Client::new(&env, &loan.token_address);
         let mut total_slash: i128 = 0;
@@ -917,6 +655,14 @@ impl QuorumCreditContract {
         {
             ReputationNftExternalClient::new(&env, &nft_addr).burn(&borrower);
         }
+
+        // Update credit score after auto slash
+        let _ = credit_score::update_credit_score(env.clone(), borrower.clone());
+
+        // Clean up vouches storage last
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Vouches(borrower.clone()));
     }
 
     /// Allows vouchers to claim back their stake if loan has expired without repayment or slash.
@@ -932,6 +678,9 @@ impl QuorumCreditContract {
 
         let now = env.ledger().timestamp();
         assert!(now >= loan.deadline, "loan has not expired yet");
+
+        // Process withdrawal queue first (Issue #865)
+        vouch::process_withdrawal_queue(&env, &borrower);
 
         let vouches: Vec<VouchRecord> = env
             .storage()
@@ -1114,6 +863,8 @@ impl QuorumCreditContract {
 
     pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
         admin::add_admin(env, admin_signers, new_admin)
+    }
+
     /// #669: Retry a failed repayment. Increments retry_count and re-attempts the transfer.
     /// Returns `MaxRetriesExceeded` if retry_count >= MAX_REPAYMENT_RETRIES.
     pub fn retry_repayment(
@@ -1426,178 +1177,6 @@ impl QuorumCreditContract {
             .unwrap_or(0)
     }
 
-    pub fn get_paused(env: Env) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
-    }
-
-    pub fn loan_status(env: Env, borrower: Address) -> LoanStatus {
-        loan::loan_status(env, borrower)
-    }
-
-    pub fn vouch_exists(env: Env, voucher: Address, borrower: Address) -> bool {
-        vouch::vouch_exists(env, voucher, borrower)
-    }
-
-    pub fn is_whitelisted(env: Env, voucher: Address) -> bool {
-        admin::is_whitelisted(env, voucher)
-    }
-
-    pub fn get_loan(env: Env, borrower: Address) -> Option<LoanRecord> {
-        loan::get_loan(env, borrower)
-    }
-
-    pub fn get_loan_by_id(env: Env, loan_id: u64) -> Option<LoanRecord> {
-        loan::get_loan_by_id(env, loan_id)
-    }
-
-    pub fn get_vouches(env: Env, borrower: Address) -> Option<Vec<VouchRecord>> {
-        env.storage().persistent().get(&DataKey::Vouches(borrower))
-    }
-
-    pub fn is_eligible(env: Env, borrower: Address, threshold: i128) -> bool {
-        loan::is_eligible(env, borrower, threshold)
-    }
-
-    pub fn get_contract_balance(env: Env) -> i128 {
-        helpers::token(&env).balance(&env.current_contract_address())
-    }
-
-    pub fn voucher_history(env: Env, voucher: Address) -> Vec<Address> {
-        vouch::voucher_history(env, voucher)
-    }
-
-    pub fn get_reputation(env: Env, borrower: Address) -> u32 {
-        let nft_addr: Address = match env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::ReputationNft)
-        {
-            Some(a) => a,
-            None => return 0,
-        };
-        ReputationNftExternalClient::new(&env, &nft_addr).balance(&borrower)
-    }
-
-    pub fn has_excellent_badge(env: Env, borrower: Address) -> bool {
-        reputation::has_excellent_badge(&env, &borrower)
-    }
-
-    pub fn get_excellent_badge(env: Env, borrower: Address) -> Option<crate::types::ReputationNFTRecord> {
-        reputation::get_excellent_badge(&env, &borrower)
-    }
-
-    pub fn total_vouched(env: Env, borrower: Address) -> Result<i128, ContractError> {
-        vouch::total_vouched(env, borrower)
-    }
-
-    // ── Issue #863: Vouch Cooldown Bypass ─────────────────────────────────────
-
-    /// Admin grants a one-time emergency cooldown bypass to a voucher.
-    pub fn set_emergency_cooldown_bypass(
-        env: Env,
-        admin_signers: Vec<Address>,
-        voucher: Address,
-        enabled: bool,
-    ) -> Result<(), ContractError> {
-        vouch::set_emergency_cooldown_bypass(env, admin_signers, voucher, enabled)
-    }
-
-    /// Query whether an emergency cooldown bypass is active for a voucher.
-    pub fn has_emergency_cooldown_bypass(env: Env, voucher: Address) -> bool {
-        vouch::has_emergency_cooldown_bypass(env, voucher)
-    }
-
-    /// Vouch with emergency cooldown bypass (single-use, admin-granted).
-    pub fn emergency_vouch(
-        env: Env,
-        voucher: Address,
-        borrower: Address,
-        stake: i128,
-        token: Address,
-    ) -> Result<(), ContractError> {
-        vouch::emergency_vouch(env, voucher, borrower, stake, token)
-    }
-
-    // ── Issue #864: Multi-token Stake Aggregation ─────────────────────────────
-
-    /// Total vouched stake for `borrower` across all accepted tokens.
-    pub fn total_vouched_all_tokens(env: Env, borrower: Address) -> Result<i128, ContractError> {
-        vouch::total_vouched_all_tokens(env, borrower)
-    }
-
-    /// Eligibility check using aggregated multi-token stake ≥ `threshold`.
-    pub fn is_eligible_multi_token(env: Env, borrower: Address, threshold: i128) -> bool {
-        vouch::is_eligible_multi_token(env, borrower, threshold)
-    }
-
-    // ── Issue #867: Cross-Collateral Vouch Pools ──────────────────────────────
-
-    /// Create a shared collateral pool; returns the new pool ID.
-    pub fn create_pool(env: Env, creator: Address, token: Address, initial_stake: i128) -> Result<u64, ContractError> {
-        collateral_pool::create_pool(env, creator, token, initial_stake)
-    }
-
-    /// Join an existing pool by contributing stake.
-    pub fn join_pool(env: Env, voucher: Address, pool_id: u64, stake: i128) -> Result<(), ContractError> {
-        collateral_pool::join_pool(env, voucher, pool_id, stake)
-    }
-
-    /// Leave a pool and withdraw stake (only when pool has no active borrower).
-    pub fn leave_pool(env: Env, voucher: Address, pool_id: u64) -> Result<(), ContractError> {
-        collateral_pool::leave_pool(env, voucher, pool_id)
-    }
-
-    /// Admin assigns a pool to back a borrower, locking the collateral.
-    pub fn assign_pool_to_borrower(env: Env, admin_signers: Vec<Address>, pool_id: u64, borrower: Address) -> Result<(), ContractError> {
-        collateral_pool::assign_pool_to_borrower(env, admin_signers, pool_id, borrower)
-    }
-
-    /// Total stake held in a pool.
-    pub fn get_pool_total_stake(env: Env, pool_id: u64) -> Result<i128, ContractError> {
-        collateral_pool::get_pool_total_stake(env, pool_id)
-    }
-
-    /// Read a pool record.
-    pub fn get_pool(env: Env, pool_id: u64) -> Result<crate::types::CollateralPool, ContractError> {
-        collateral_pool::get_pool(env, pool_id)
-    }
-
-    // ── Issue #868: Gradual Unstaking ─────────────────────────────────────────
-
-    /// Schedule progressive stake revocation across `instalments` tranches.
-    pub fn start_gradual_unstake(env: Env, voucher: Address, borrower: Address, instalments: u32, interval_secs: u64) -> Result<(), ContractError> {
-        gradual_unstake::start_gradual_unstake(env, voucher, borrower, instalments, interval_secs)
-    }
-
-    /// Claim the next instalment of an active gradual-unstake schedule.
-    pub fn claim_gradual_instalment(env: Env, voucher: Address, borrower: Address) -> Result<i128, ContractError> {
-        gradual_unstake::claim_gradual_instalment(env, voucher, borrower)
-    }
-
-    /// Cancel a gradual-unstake schedule and return remaining stake immediately.
-    pub fn cancel_gradual_unstake(env: Env, voucher: Address, borrower: Address) -> Result<(), ContractError> {
-        gradual_unstake::cancel_gradual_unstake(env, voucher, borrower)
-    }
-
-    /// Query the active gradual-unstake schedule for a (voucher, borrower) pair.
-    pub fn get_gradual_unstake_schedule(env: Env, voucher: Address, borrower: Address) -> Option<crate::types::GradualUnstakeSchedule> {
-        gradual_unstake::get_gradual_unstake_schedule(env, voucher, borrower)
-    }
-
-    pub fn repayment_count(env: Env, borrower: Address) -> u32 {
-        loan::repayment_count(env, borrower)
-    }
-
-    pub fn loan_count(env: Env, borrower: Address) -> u32 {
-        loan::loan_count(env, borrower)
-    }
-
-    pub fn default_count(env: Env, borrower: Address) -> u32 {
-        loan::default_count(env, borrower)
-    }
 
     pub fn get_protocol_fee(env: Env) -> u32 {
         admin::get_protocol_fee(env)
@@ -1633,6 +1212,8 @@ impl QuorumCreditContract {
 
     pub fn get_config(env: Env) -> Config {
         admin::get_config(env)
+    }
+
     // ── Issue #682: multi-sig config updates ──────────────────────────────────
 
     pub fn propose_config_update(
