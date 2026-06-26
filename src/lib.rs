@@ -16,6 +16,7 @@ pub mod syndication;
 mod tests;
 pub mod types;
 pub mod vouch;
+pub mod yield_stream;
 pub mod cache;
 pub mod error_response;
 pub mod versioning;
@@ -1541,5 +1542,19 @@ impl QuorumCreditContract {
 
     pub fn remove_attribute(env: Env, caller: Address, key: soroban_sdk::String) -> Result<(), ContractError> {
         attributes::remove_attribute(env, caller, key)
+    }
+
+    // ── Yield Stream ─────────────────────────────────────────────────────────
+
+    pub fn claim_streamed_yield(env: Env, voucher: Address, loan_id: u64) -> Result<i128, ContractError> {
+        yield_stream::claim_streamed_yield(env, voucher, loan_id)
+    }
+
+    pub fn get_yield_stream_state(env: Env, loan_id: u64) -> Option<YieldStreamState> {
+        yield_stream::get_yield_stream_state(env, loan_id)
+    }
+
+    pub fn get_voucher_yield_claim(env: Env, loan_id: u64, voucher: Address) -> Option<VoucherYieldClaim> {
+        yield_stream::get_voucher_yield_claim(env, loan_id, voucher)
     }
 }

@@ -118,6 +118,9 @@ pub const DEFERMENT_PERIOD_SECS: u64 = 30 * 24 * 60 * 60;
 /// Penalty applied to partial mid-loan withdrawals, in basis points (1000 = 10%).
 pub const PARTIAL_WITHDRAWAL_PENALTY_BPS: i128 = 1_000;
 
+/// Yield stream period in seconds (7 days).
+pub const YIELD_STREAM_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RateLimitConfig {
@@ -443,6 +446,8 @@ pub enum DataKey {
     /// Reputation NFT badge for excellent credit tier: borrower → ReputationNFTRecord
     ReputationNFTBadge(Address),
     CustomAttributes(Address), // address -> Vec<AttributeEntry>
+    YieldStreamState(u64), // loan_id -> YieldStreamState
+    VoucherYieldClaim(u64, Address), // loan_id, voucher -> VoucherYieldClaim
 }
 
 // ── Governance ────────────────────────────────────────────────────────────────
@@ -1448,4 +1453,23 @@ pub struct ErrorResponse {
 pub struct AttributeEntry {
     pub key: soroban_sdk::String,
     pub value: soroban_sdk::String,
+}
+
+// ── Yield Stream ───────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone)]
+pub struct YieldStreamState {
+    pub loan_id: u64,
+    pub last_claim_timestamp: u64,
+    pub total_yield_claimed: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct VoucherYieldClaim {
+    pub voucher: Address,
+    pub loan_id: u64,
+    pub last_claim_timestamp: u64,
+    pub yield_claimed: i128,
 }
