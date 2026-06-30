@@ -135,6 +135,18 @@ mod batch_vouch_selective_rollback_test;
 #[cfg(test)]
 mod chaos_test;
 
+/// Issue #104: Event regression tests — event snapshots for critical transitions.
+#[cfg(test)]
+mod event_regression_test;
+
+/// Issue #105: Performance regression tests — gas/latency baselines.
+#[cfg(test)]
+mod gas_test;
+
+/// Issue #107: Specification tests — auto-generated from API spec.
+#[cfg(test)]
+mod spec_test;
+
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, is_zero_address,
     loan_status as helper_loan_status, require_allowed_token, require_not_paused,
