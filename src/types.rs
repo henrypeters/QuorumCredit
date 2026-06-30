@@ -419,6 +419,8 @@ pub enum DataKey {
     StakingDerivative(Address, Address),
     // #637: Fraud Detection
     VoucherFraudScore(Address),
+    /// Issue #637: on-demand fraud detection configuration
+    FraudScoreConfig,
     /// Repayment dispute raised by a voucher: (borrower, voucher) -> DisputeRecord
     RepaymentDispute(Address, Address),
     // #667: Oracle address for repayment verification
@@ -1475,6 +1477,82 @@ pub struct VoucherStats {
     pub total_yield_earned: i128,
     pub total_slashed: i128,
 }
+
+// ── Issue #637: On-Demand Fraud Detection ──────────────────────────────────
+
+/// Fraud score for a voucher, computed on demand.
+/// Range: 0 (no risk) to 1000 (high risk).
+#[contracttype]
+#[derive(Clone)]
+pub struct VoucherFraudScore {
+    /// Overall fraud risk score (0-1000)
+    pub score: u32,
+    /// Ledger timestamp when the score was last computed
+    pub last_updated: u64,
+    /// Number of distinct borrowers this voucher has backed
+    pub total_borrowers: u32,
+    /// Number of borrowers who defaulted
+    pub defaulted_count: u32,
+    /// Number of vouch modifications (withdrawals/decreases)
+    pub churn_count: u32,
+    /// Number of disputes involving this voucher
+    pub dispute_count: u32,
+    /// Total stake across all active vouches (stroops)
+    pub total_stake: i128,
+    /// Vouch rapidity score component (0-1000)
+    pub rapidity_score: u32,
+    /// Default correlation score component (0-1000)
+    pub default_correlation_score: u32,
+    /// Churn rate score component (0-1000)
+    pub churn_score: u32,
+    /// Dispute involvement score component (0-1000)
+    pub dispute_score: u32,
+}
+
+/// Weights for fraud detection signal components.
+/// Each weight is in basis points (e.g., 3000 = 30%).
+#[contracttype]
+#[derive(Clone)]
+pub struct FraudFactors {
+    /// Weight for rapid vouch creation rate
+    pub rapidity_weight: u32,
+    /// Weight for default correlation among backed borrowers
+    pub default_correlation_weight: u32,
+    /// Weight for vouch churn (withdrawals / decreases)
+    pub churn_weight: u32,
+    /// Weight for dispute involvement
+    pub dispute_weight: u32,
+}
+
+/// On-demand fraud detection configuration.
+#[contracttype]
+#[derive(Clone)]
+pub struct FraudScoreConfig {
+    /// Whether fraud scoring is enabled
+    pub enabled: bool,
+    /// Factor weights for score calculation
+    pub factors: FraudFactors,
+    /// Threshold above which a voucher is considered high-risk (0-1000)
+    pub high_risk_threshold: u32,
+    /// Threshold above which a voucher is considered medium-risk (0-1000)
+    pub medium_risk_threshold: u32,
+}
+
+/// Default fraud detection factor weights.
+pub const DEFAULT_FRAUD_FACTORS: FraudFactors = FraudFactors {
+    rapidity_weight: 3000,              // 30%
+    default_correlation_weight: 3500,   // 35%
+    churn_weight: 2000,                 // 20%
+    dispute_weight: 1500,               // 15%
+};
+
+/// Default fraud score configuration.
+pub const DEFAULT_FRAUD_SCORE_CONFIG: FraudScoreConfig = FraudScoreConfig {
+    enabled: true,
+    factors: DEFAULT_FRAUD_FACTORS,
+    high_risk_threshold: 700,
+    medium_risk_threshold: 400,
+};
 
 /// Current API version of the contract.
 pub const API_VERSION: u32 = 1;

@@ -8,6 +8,7 @@ pub mod cache;
 pub mod collateral_pool;
 pub mod credit_score;
 pub mod cross_chain;
+pub mod detection;
 pub mod errors;
 pub mod error_response;
 pub mod governance;
@@ -27,15 +28,6 @@ pub mod versioning;
 pub mod vouch;
 pub mod vouch_groups;
 pub mod yield_stream;
-pub mod cache;
-pub mod error_response;
-pub mod versioning;
-pub mod cross_chain;
-/// Issue #867: Cross-Collateral Vouch Pools
-pub mod collateral_pool;
-/// Issue #868: Gradual Unstaking
-pub mod gradual_unstake;
-/// Issue #887: Loan Subordination and Cascading Debt Hierarchy
 pub mod subordination;
 
 pub use errors::ContractError;
@@ -130,6 +122,8 @@ mod refinance_test;
 mod incentives_verification_test;
 #[cfg(test)]
 mod regression_past_bugs_test;
+#[cfg(test)]
+mod detection_test;
 
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, loan_status as helper_loan_status,
@@ -1555,6 +1549,28 @@ impl QuorumCreditContract {
         credit_score::get_tier_rewards(env, tier)
     }
 
+    // ── Issue #637: On-Demand Fraud Detection ──────────────────────────────────
+
+    pub fn update_fraud_score(env: Env, voucher: Address) -> Result<(), ContractError> {
+        detection::update_fraud_score(env, voucher)
+    }
+
+    pub fn get_fraud_score(env: Env, voucher: Address) -> Option<VoucherFraudScore> {
+        detection::get_fraud_score(env, voucher)
+    }
+
+    pub fn set_fraud_score_config(
+        env: Env,
+        admin_signers: Vec<Address>,
+        config: FraudScoreConfig,
+    ) -> Result<(), ContractError> {
+        detection::set_fraud_score_config(env, admin_signers, config)
+    }
+
+    pub fn get_fraud_score_config_view(env: Env) -> FraudScoreConfig {
+        detection::get_fraud_score_config_view(env)
+    }
+
     // ── Loan Pool Syndication for Multi-Borrower Loans ─────────────────────────
 
     pub fn create_syndication(
@@ -2094,7 +2110,6 @@ impl QuorumCreditContract {
     ) -> VouchPage {
         admin::get_vouches_paginated(env, borrower, cursor, page_size)
     }
-}
 
     // ── Issue #893: Multi-Tier Admin Approval ──────────────────────────────────
 
