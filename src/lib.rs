@@ -1778,6 +1778,28 @@ impl QuorumCreditContract {
 
     // ── Issue #14: Cross-chain loan portability ───────────────────────────────
 
+    pub fn register_bridge(
+        env: Env,
+        admin_signers: Vec<Address>,
+        chain_id: u32,
+        chain_name: soroban_sdk::String,
+        bridge_address: Address,
+    ) -> Result<(), ContractError> {
+        cross_chain::register_bridge(env, admin_signers, chain_id, chain_name, bridge_address)
+    }
+
+    pub fn remove_bridge(
+        env: Env,
+        admin_signers: Vec<Address>,
+        chain_id: u32,
+    ) -> Result<(), ContractError> {
+        cross_chain::remove_bridge(env, admin_signers, chain_id)
+    }
+
+    pub fn get_bridges(env: Env) -> Vec<BridgeRecord> {
+        cross_chain::get_bridges(env)
+    }
+
     pub fn set_bridge_public_key(
         env: Env,
         admin_signers: Vec<Address>,

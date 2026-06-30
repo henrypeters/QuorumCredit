@@ -151,7 +151,7 @@ pub fn vouch_cross_chain(
     token: Address,
     chain_id: u32,
 ) -> Result<(), ContractError> {
-    vouch_with_chain(env, voucher, borrower, stake, token, chain_id)
+    vouch_with_chain(env, voucher, borrower, stake, token, Some(chain_id))
 }
 
 fn vouch_with_chain(
@@ -160,7 +160,7 @@ fn vouch_with_chain(
     borrower: Address,
     stake: i128,
     token: Address,
-    chain_id: u32,
+    chain_id: Option<u32>,
 ) -> Result<(), ContractError> {
     voucher.require_auth();
     require_not_thawing(&env)?;
@@ -171,7 +171,7 @@ fn vouch_with_chain(
     }
 
     let cfg = VouchConfig::load(&env);
-    do_vouch(&env, &cfg, voucher, borrower, stake, token, Some(chain_id))
+    do_vouch(&env, &cfg, voucher, borrower, stake, token, chain_id)
 }
 
 fn validate_vouch<'a>(
@@ -211,10 +211,9 @@ fn validate_vouch<'a>(
 
     let token_client = require_allowed_token(env, token)?;
 
-    // Bridge validation: if chain_id is provided, the token must originate from
-    // a registered, active bridge for that chain.
+    // Bridge validation: if chain_id is provided, check against registered bridge registry
     if let Some(cid) = chain_id {
-        validate_bridge(env, cid, token)?;
+        validate_bridge(env, cid)?;
     }
 
     if cfg.min_stake > 0 && stake < cfg.min_stake {
