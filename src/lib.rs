@@ -1795,6 +1795,28 @@ impl QuorumCreditContract {
         credit_score::get_tier_rewards(env, tier)
     }
 
+    // ── Issue #637: On-Demand Fraud Detection ──────────────────────────────────
+
+    pub fn update_fraud_score(env: Env, voucher: Address) -> Result<(), ContractError> {
+        detection::update_fraud_score(env, voucher)
+    }
+
+    pub fn get_fraud_score(env: Env, voucher: Address) -> Option<VoucherFraudScore> {
+        detection::get_fraud_score(env, voucher)
+    }
+
+    pub fn set_fraud_score_config(
+        env: Env,
+        admin_signers: Vec<Address>,
+        config: FraudScoreConfig,
+    ) -> Result<(), ContractError> {
+        detection::set_fraud_score_config(env, admin_signers, config)
+    }
+
+    pub fn get_fraud_score_config_view(env: Env) -> FraudScoreConfig {
+        detection::get_fraud_score_config_view(env)
+    }
+
     // ── Loan Pool Syndication for Multi-Borrower Loans ─────────────────────────
 
     pub fn create_syndication(

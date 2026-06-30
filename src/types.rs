@@ -422,6 +422,8 @@ pub enum DataKey {
     StakingDerivative(Address, Address),
     // #637: Fraud Detection
     VoucherFraudScore(Address),
+    /// Issue #637: on-demand fraud detection configuration
+    FraudScoreConfig,
     /// Repayment dispute raised by a voucher: (borrower, voucher) -> DisputeRecord
     RepaymentDispute(Address, Address),
     // #667: Oracle address for repayment verification
