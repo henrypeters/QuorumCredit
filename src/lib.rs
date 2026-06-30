@@ -4,6 +4,7 @@ pub mod admin;
 pub mod archive;
 pub mod attributes;
 pub mod batch_transfer;
+pub mod ipfs_archive;
 pub mod cache;
 pub mod collateral_pool;
 pub mod credit_score;
@@ -131,6 +132,9 @@ mod regression_past_bugs_test;
 #[cfg(test)]
 mod batch_vouch_selective_rollback_test;
 
+#[cfg(test)]
+mod chaos_test;
+
 use crate::helpers::{
     config, get_active_loan_record, has_active_loan, is_zero_address,
     loan_status as helper_loan_status, require_allowed_token, require_not_paused,
@@ -175,7 +179,7 @@ impl QuorumCreditContract {
                 admin_threshold,
                 admin_whitelist: Vec::new(&env),
                 admin_blacklist: Vec::new(&env),
-                token,
+                token: token.clone(),
                 allowed_tokens: Vec::new(&env),
                 yield_bps: DEFAULT_YIELD_BPS,
                 slash_bps: DEFAULT_SLASH_BPS,
@@ -200,6 +204,14 @@ impl QuorumCreditContract {
                     enabled: false,
                 },
                 multi_tier_thresholds: None, // Issue #893: Initialize with no multi-tier thresholds
+                recovery_percentage: 0,
+                dynamic_slash_threshold: false,
+                loan_size_slash_enabled: false,
+                loan_size_slash_max_bps: 0,
+                confirmation_required: false,
+                admin_compensation_bps: 0,
+                removal_vote_threshold: 0,
+                insurance_premium_bps: 0,
             },
         );
 
@@ -557,14 +569,6 @@ impl QuorumCreditContract {
         // Burn excellent credit tier badge on default
         reputation::burn_excellent_badge(&env, &borrower);
 
-        if let Some(nft_addr) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::ReputationNft)
-        {
-            ReputationNftExternalClient::new(&env, &nft_addr).burn(&borrower);
-        }
-
         // Update credit score after slash
         let _ = credit_score::update_credit_score(env.clone(), borrower.clone());
 
@@ -759,7 +763,7 @@ impl QuorumCreditContract {
         let mut loan = helpers::get_active_loan_record(&env, &borrower)
             .expect("no active loan");
 
-        if loan.repaid || loan.defaulted {
+        if loan.status != LoanStatus::Active {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
         assert!(
@@ -774,7 +778,7 @@ impl QuorumCreditContract {
             .get(&DataKey::Vouches(borrower.clone()))
             .unwrap_or(Vec::new(&env));
 
-        loan.defaulted = true;
+        loan.status = LoanStatus::Defaulted;
         env.storage()
             .persistent()
             .set(&DataKey::Loan(loan.id), &loan);
@@ -846,7 +850,7 @@ impl QuorumCreditContract {
         let mut loan = helpers::get_active_loan_record(&env, &borrower)
             .expect("no active loan");
 
-        if loan.repaid || loan.defaulted {
+        if loan.status != LoanStatus::Active {
             panic_with_error!(&env, ContractError::NoActiveLoan);
         }
 
@@ -873,7 +877,7 @@ impl QuorumCreditContract {
             }
         }
 
-        loan.defaulted = true;
+        loan.status = LoanStatus::Defaulted;
         env.storage()
             .persistent()
             .set(&DataKey::Loan(loan.id), &loan);
@@ -897,7 +901,7 @@ impl QuorumCreditContract {
         assert!(amount > 0, "no slashed funds to withdraw");
 
         env.storage().instance().set(&DataKey::SlashTreasury, &0i128);
-        helpers::token(&env).transfer(&env.current_contract_address(), &recipient, &amount);
+        helpers::primary_token(&env).transfer(&env.current_contract_address(), &recipient, &amount);
     }
 
     // ── Loan Pool ─────────────────────────────────────────────────────────────
@@ -953,7 +957,7 @@ impl QuorumCreditContract {
             total_amount += amount;
         }
 
-        let token_client = helpers::token(&env);
+        let token_client = helpers::primary_token(&env);
         let contract_balance = token_client.balance(&env.current_contract_address());
         if contract_balance < total_amount {
             return Err(ContractError::PoolInsufficientFunds);
@@ -980,18 +984,33 @@ impl QuorumCreditContract {
                 &LoanRecord {
                     id: loan_id,
                     borrower: borrower.clone(),
+                    guarantor: None,
+                    buyback_price: 0,
+                    auto_repay_enabled: false,
+                    auto_repay_attempts: 0,
+                    escrow_status: EscrowStatus::None,
                     co_borrowers: Vec::new(&env),
                     amount,
                     amount_repaid: 0,
                     total_yield: amount * cfg.yield_bps / 10_000,
-                    repaid: false,
-                    defaulted: false,
+                    status: LoanStatus::Active,
                     created_at: now,
                     disbursement_timestamp: now,
                     repayment_timestamp: None,
                     deadline,
                     loan_purpose: soroban_sdk::String::from_str(&env, "pool"),
                     token_address: cfg.token.clone(),
+                    amortization_schedule: Vec::new(&env),
+                    reminder_sent: false,
+                    risk_score: 0,
+                    deferment_periods: 0,
+                    maturity_date: None,
+                    rate_type: RateType::Fixed,
+                    index_reference: None,
+                    last_interest_calc: now,
+                    accrued_interest: 0,
+                    milestone_bonus_applied: false,
+                    retry_count: 0,
                 },
             );
             env.storage()
@@ -1136,16 +1155,6 @@ impl QuorumCreditContract {
     /// Returns the total primary-token stake for `borrower`.
     pub fn total_vouched(env: Env, borrower: Address) -> Result<i128, ContractError> {
         vouch::total_vouched(env, borrower)
-    }
-
-    /// Issue #71: Batch stake calculation.
-    /// Returns the total primary-token stake for each address in `borrowers`
-    /// in a single call, preserving input order.
-    pub fn batch_total_stake(
-        env: Env,
-        borrowers: Vec<Address>,
-    ) -> Result<Vec<BorrowerStake>, ContractError> {
-        vouch::batch_total_stake(env, borrowers)
     }
 
     pub fn get_config(env: Env) -> Config {
@@ -1330,10 +1339,6 @@ impl QuorumCreditContract {
 
     // ── Admin management ─────────────────────────────────────────────────────
 
-    pub fn add_admin(env: Env, admin_signers: Vec<Address>, new_admin: Address) {
-        admin::add_admin(env, admin_signers, new_admin)
-    }
-
     pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Address) {
         admin::remove_admin(env, admin_signers, admin_to_remove)
     }
@@ -1461,36 +1466,12 @@ impl QuorumCreditContract {
         env.storage().instance().set(&DataKey::Config, &cfg);
     }
 
-    pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
+    pub fn add_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) -> Result<(), ContractError> {
         admin::add_allowed_token(env, admin_signers, token)
     }
 
     pub fn remove_allowed_token(env: Env, admin_signers: Vec<Address>, token: Address) {
         admin::remove_allowed_token(env, admin_signers, token)
-    }
-
-    pub fn set_slash_vote_quorum(env: Env, admin_signers: Vec<Address>, quorum_bps: u32) {
-        helpers::require_admin_approval(&env, &admin_signers);
-        governance::set_slash_vote_quorum(&env, quorum_bps);
-    }
-
-    // ── Governance ────────────────────────────────────────────────────────────
-
-    pub fn vote_slash(
-        env: Env,
-        voucher: Address,
-        borrower: Address,
-        approve: bool,
-    ) -> Result<(), ContractError> {
-        governance::vote_slash(env, voucher, borrower, approve)
-    }
-
-    pub fn get_slash_vote(env: Env, borrower: Address) -> Option<SlashVoteRecord> {
-        governance::get_slash_vote(env, borrower)
-    }
-
-    pub fn get_slash_vote_quorum(env: Env) -> u32 {
-        governance::get_slash_vote_quorum(env)
     }
 
     // ── Views ─────────────────────────────────────────────────────────────────
@@ -1549,10 +1530,6 @@ impl QuorumCreditContract {
 
     pub fn get_max_vouchers_per_loan(env: Env) -> u32 {
         config(&env).max_vouchers
-    }
-
-    pub fn get_config(env: Env) -> Config {
-        admin::get_config(env)
     }
 
     // ── Issue #682: multi-sig config updates ──────────────────────────────────
@@ -1810,7 +1787,7 @@ impl QuorumCreditContract {
     }
 
     /// Register an IPFS archive for vouch history batch.
-    pub fn register_vouch_history_ipfs_archive(
+    pub fn reg_vouch_history_ipfs_archive(
         env: Env,
         archive_id: u64,
         ipfs_hash: String,

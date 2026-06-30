@@ -820,13 +820,14 @@ pub fn process_withdrawal_queue(env: &Env, borrower: &Address) {
     for queued in sorted_queue.iter() {
         let idx_opt = vouches.iter().position(|v| v.voucher == queued.voucher);
         if let Some(idx) = idx_opt {
-            let vouch_rec = vouches.get(idx).unwrap();
+            let idx_u32 = idx as u32;
+            let vouch_rec = vouches.get(idx_u32).unwrap();
             let token_client = require_allowed_token(env, &vouch_rec.token).ok();
             if let Some(tc) = token_client {
                 let contract = env.current_contract_address();
                 tc.transfer(&contract, &vouch_rec.voucher, &vouch_rec.stake);
             }
-            vouches.remove(idx);
+            vouches.remove(idx_u32);
             processed_vouchers.push_back(queued.voucher.clone());
 
             env.events().publish(
@@ -914,10 +915,10 @@ pub fn process_withdrawal_batch(env: &Env, borrower: &Address, count: u32) -> u3
         }
     }
 
-    let process_count = if count as usize > sorted_queue.len() {
+    let process_count: u32 = if count > sorted_queue.len() {
         sorted_queue.len()
     } else {
-        count as usize
+        count
     };
 
     let mut processed: u32 = 0;
@@ -1181,7 +1182,7 @@ fn detect_circular_delegation(
                         if next_delegate == *voucher {
                             return Err(ContractError::CircularDelegation);
                         }
-                        if !visited.iter().any(|a| a == &next_delegate) {
+                        if !visited.iter().any(|a| a == next_delegate) {
                             if visited.len() as u32 >= MAX_DEPTH {
                                 return Ok(());
                             }
@@ -1249,7 +1250,7 @@ pub fn delegate_vouch(
         timestamp,
         modification_type: soroban_sdk::String::from_str(&env, "delegated"),
         stake_amount: vouch_rec.stake,
-        delegate: Some(delegate),
+        delegate: Some(delegate.clone()),
     });
 
     env.storage().persistent().set(
@@ -1672,26 +1673,29 @@ pub fn compute_and_store_merkle_root(env: Env, borrower: Address) -> Result<soro
         return Err(ContractError::NoVouchesForBorrower);
     }
 
-    // Build leaves from vouches: hash(voucher || stake || token)
+    // Build leaves from vouches: each leaf is 32 zero-bytes (placeholder for serialized vouch data)
+    // In production, a proper serialization of (voucher, stake, token) should be used.
     let mut leaves: Vec<soroban_sdk::Bytes> = Vec::new(&env);
-    for v in vouches.iter() {
-        let mut leaf_data = Vec::new(&env);
-        leaf_data.push_back(v.voucher.clone());
-        leaf_data.push_back(v.stake);
-        leaf_data.push_back(v.token.clone());
-        
-        // For simplicity, use direct hashing of serialized components
-        // In production, use proper serialization
-        let leaf_bytes = soroban_sdk::Bytes::from_slice(&[0u8; 32]); // Placeholder
+    for _v in vouches.iter() {
+        let leaf_bytes = soroban_sdk::Bytes::from_array(&env, &[0u8; 32]);
         leaves.push_back(leaf_bytes);
     }
 
     // Compute Merkle root
-    let root = crate::merkle_tree::build_merkle_root(&env, leaves);
+    let root_bytes = crate::merkle_tree::build_merkle_root(&env, leaves);
+    // Convert the 32-byte Bytes result to BytesN<32>
+    let root_arr: [u8; 32] = {
+        let mut arr = [0u8; 32];
+        for i in 0..32u32 {
+            arr[i as usize] = root_bytes.get(i).unwrap_or(0);
+        }
+        arr
+    };
+    let root = soroban_sdk::BytesN::from_array(&env, &root_arr);
 
     // Store the root
     let merkle_record = VouchMerkleRoot {
-        root: soroban_sdk::BytesN::from_array(&env, &root.as_slice()[0..32].try_into().unwrap()),
+        root: root.clone(),
         vouch_count: vouches.len(),
         computed_at: env.ledger().timestamp(),
     };
@@ -1701,7 +1705,7 @@ pub fn compute_and_store_merkle_root(env: Env, borrower: Address) -> Result<soro
         .set(&DataKey::VouchMerkleRoot(borrower.clone()), &merkle_record);
 
     env.events().publish(
-        (symbol_short!("vouch"), symbol_short!("merkle_root_computed")),
+        (symbol_short!("vouch"), symbol_short!("mrkl_root")),
         (borrower.clone(), vouches.len()),
     );
 
