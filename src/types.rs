@@ -434,6 +434,8 @@ pub enum DataKey {
     VoucherInsurance(Address, Address),
     /// Cross-chain bridge validation status: (voucher, chain_id) → bool.
     BridgeValidated(Address, u32),
+    /// Registered cross-chain bridges: Vec<BridgeRecord>
+    Bridges,
     /// Issue #687: admin removal proposal id → AdminRemovalProposal
     AdminRemovalProposal(u64),
     /// Issue #687: monotonically increasing admin removal proposal counter
@@ -614,6 +616,8 @@ pub struct CollateralPool {
     pub members: Vec<Address>,
     /// Stake per member (parallel to `members`), in stroops.
     pub stakes: Vec<i128>,
+    /// Origin chain per member (parallel to `members`). `0` is the native chain.
+    pub chain_ids: Vec<u32>,
     pub token: Address,
     pub borrower: Option<Address>,
     pub active: bool,
@@ -1931,250 +1935,17 @@ pub struct WaterfallDistribution {
 pub const MAX_SUBORDINATION_DEPTH: u32 = 10; // Prevent deeply nested hierarchies
 pub const MAX_SUBORDINATES_PER_LOAN: u32 = 50; // Prevent excessive branching
 
-// ── Issue #934: Yield Calculation Caching ────────────────────────────────────
-
-// ── Issue #907: Yield Streaming ───────────────────────────────────────────────
-
-/// Per-loan yield stream state, tracking how much yield has been claimed so far.
+/// Result for a single entry in `batch_vouch` with selective rollback semantics (Issue #1055).
+/// Successful entries are committed; failed entries are skipped with an error code.
 #[contracttype]
-#[derive(Clone)]
-pub struct YieldStreamState {
-    pub loan_id: u64,
-    pub last_claim_timestamp: u64,
-    pub total_yield_claimed: i128,
-}
-
-/// Per-voucher yield claim record for a specific loan.
-#[contracttype]
-#[derive(Clone)]
-pub struct VoucherYieldClaim {
-    pub voucher: Address,
-    pub loan_id: u64,
-    pub last_claim_timestamp: u64,
-    pub yield_claimed: i128,
-}
-
-// ── Issue #908: Periodic Payments ─────────────────────────────────────────────
-
-/// Schedule type for periodic payments.
-#[contracttype]
-#[derive(Clone, PartialEq)]
-pub enum ScheduleType {
-    Weekly,
-    BiWeekly,
-    Monthly,
-    Quarterly,
-}
-
-/// Configuration for a periodic payment schedule on a loan.
-#[contracttype]
-#[derive(Clone)]
-pub struct PeriodicPaymentConfig {
-    pub schedule_type: ScheduleType,
-    pub period_count: u32,
-    pub period_interest_bps: u32,
-    pub periods_completed: u32,
-    pub enabled: bool,
-}
-
-/// Runtime status of a periodic payment schedule.
-#[contracttype]
-#[derive(Clone)]
-pub struct PeriodicPaymentStatus {
-    pub loan_id: u64,
-    pub config: PeriodicPaymentConfig,
-    pub next_period_due: u64,
-    pub last_payment_timestamp: u64,
-    pub total_period_interest_paid: i128,
-}
-
-// ── Issue #909: Vouch Groups ───────────────────────────────────────────────────
-
-/// A named group of vouchers for coordinated vouching.
-#[contracttype]
-#[derive(Clone)]
-pub struct VouchGroup {
-    pub group_id: u64,
-    pub name: String,
-    pub vouchers: Vec<Address>,
-    pub created_at: u64,
-}
-
-// ── Custom Attributes ─────────────────────────────────────────────────────────
-
-/// A single key-value attribute entry for custom metadata.
-#[contracttype]
-#[derive(Clone)]
-pub struct AttributeEntry {
-    pub key: String,
-    pub value: String,
-}
-
-// ── Issue #935: Batch Transfers ───────────────────────────────────────────────
-
-/// A pending token transfer to be executed in a batch.
-#[contracttype]
-#[derive(Clone)]
-pub struct BatchTransfer {
-    pub to: Address,
-    pub amount: i128,
-    pub token: Address,
-}
-
-// ── Issue #937: Lazy Slash Queue ──────────────────────────────────────────────
-
-/// A queued slash entry for lazy (batched) execution.
-#[contracttype]
-#[derive(Clone)]
-pub struct LazySlashEntry {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchVouchResult {
+    /// The borrower address for this entry.
     pub borrower: Address,
-    pub slash_amount: i128,
-    pub queued_at: u64,
-}
-
-// ── Issue #64: Oracle Price Staleness ─────────────────────────────────────────
-
-/// Staleness window for oracle price records, in seconds (1 hour).
-pub const ORACLE_PRICE_MAX_AGE_SECS: u64 = 60 * 60;
-
-/// An oracle price record with a value and timestamp.
-#[contracttype]
-#[derive(Clone)]
-pub struct OraclePriceRecord {
-    pub price: i128,
-    pub recorded_at: u64,
-}
-
-// ── Issue #65: Graduated Response / Tiered Lockdown ──────────────────────────
-
-/// Protocol threat level for graduated response.
-#[contracttype]
-#[derive(Clone, PartialEq)]
-pub enum ThreatLevel {
-    Normal,
-    Elevated,
-    Critical,
-    Lockdown,
-}
-
-// ── Issue #552 / #841: Slash Appeal ───────────────────────────────────────────
-
-/// A slash appeal record submitted by a voucher on behalf of a defaulted borrower.
-#[contracttype]
-#[derive(Clone)]
-pub struct SlashAppealRecord {
-    pub borrower: Address,
-    pub voucher: Address,
-    pub evidence_hash: BytesN<32>,
-    pub appeal_timestamp: u64,
-    pub approved: Option<bool>,
-    pub admin_votes: Vec<Address>,
-}
-
-// ── Issue #878: Loan Forbearance ──────────────────────────────────────────────
-
-/// Maximum number of forbearance periods per loan.
-pub const MAX_FORBEARANCE_PERIODS: u32 = 3;
-
-/// Default forbearance duration in seconds (30 days).
-pub const DEFAULT_FORBEARANCE_DURATION_SECS: u64 = 30 * 24 * 60 * 60;
-
-/// Status of a forbearance period.
-#[contracttype]
-#[derive(Clone, PartialEq)]
-pub enum ForbearanceStatus {
-    Active,
-    Expired,
-    Ended,
-}
-
-/// A forbearance record for a specific loan.
-#[contracttype]
-#[derive(Clone)]
-pub struct ForbearanceRecord {
-    pub loan_id: u64,
-    pub borrower: Address,
-    pub started_at: u64,
-    pub duration_secs: u64,
-    pub ends_at: u64,
-    pub original_deadline: u64,
-    pub period_number: u32,
-    pub status: ForbearanceStatus,
-}
-
-// ── Issue #877: Loan Refinancing ──────────────────────────────────────────────
-
-/// A record of a loan refinancing event.
-#[contracttype]
-#[derive(Clone)]
-pub struct RefinanceRecord {
-    pub old_loan_id: u64,
-    pub new_loan_id: u64,
-    pub borrower: Address,
-    pub old_amount: i128,
-    pub new_amount: i128,
-    pub old_rate_bps: i128,
-    pub new_rate_bps: i128,
-    pub refinanced_at: u64,
-}
-
-// ── Issue #881: Dynamic Interest Rate ─────────────────────────────────────────
-
-/// Configuration for dynamic interest rate calculation based on risk score.
-#[contracttype]
-#[derive(Clone, Copy)]
-pub struct DynamicRateConfig {
-    pub enabled: bool,
-    pub base_rate_bps: u32,
-    pub risk_adjustment_bps: u32,
-    pub rate_floor_bps: u32,
-    pub rate_cap_bps: u32,
-}
-
-/// Default dynamic rate configuration (disabled by default).
-pub const DEFAULT_DYNAMIC_RATE_CONFIG: DynamicRateConfig = DynamicRateConfig {
-    enabled: false,
-    base_rate_bps: 200,
-    risk_adjustment_bps: 10,
-    rate_floor_bps: 100,
-    rate_cap_bps: 2_000,
-};
-
-/// Per-borrower dynamic rate record computed and cached on-chain.
-#[contracttype]
-#[derive(Clone)]
-pub struct BorrowerDynamicRate {
-    pub borrower: Address,
-    pub loan_id: u64,
-    pub effective_rate_bps: u32,
-    pub risk_score: u32,
-    pub credit_tier: CreditTier,
-    pub computed_at: u64,
-}
-
-// ── Issue #688 / #689: Admin whitelist/blacklist errors ───────────────────────
-
-// ── Issue #936: Admin Action Proposal ────────────────────────────────────────
-
-/// A proposal for an admin action requiring multi-sig approval.
-#[contracttype]
-#[derive(Clone)]
-pub struct AdminActionProposal {
-    pub id: u64,
-    pub action_type: String,
-    pub proposer: Address,
-    pub approvals: Vec<Address>,
-    pub created_at: u64,
-    pub executed: bool,
-}
-
-// ── Issue #910: Vouch Merkle Root ─────────────────────────────────────────────
-
-/// Vouch Merkle root record stored per borrower.
-#[contracttype]
-#[derive(Clone)]
-pub struct VouchMerkleRoot {
-    pub root: BytesN<32>,
-    pub vouch_count: u32,
-    pub computed_at: u64,
+    /// The stake amount attempted for this entry.
+    pub stake: i128,
+    /// `true` if the vouch was committed successfully; `false` if it was skipped.
+    pub success: bool,
+    /// Error code if `success == false`; `None` when successful.
+    pub error_code: Option<u32>,
 }

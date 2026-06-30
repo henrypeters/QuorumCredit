@@ -88,6 +88,10 @@ pub enum ContractError {
     ArithmeticError = 62,
     /// No rollback snapshot found for the requested deployment index (#744).
     RollbackSnapshotNotFound = 63,
+    /// The chain_id used in a cross-chain vouch is not registered or is inactive.
+    InvalidChain = 98,
+    /// A bridge for this chain_id has already been registered.
+    BridgeAlreadyRegistered = 99,
     /// No Ed25519 verification key is configured for the origin chain.
     BridgeNotConfigured = 100,
     /// The origin/destination chain combination is invalid.
@@ -174,46 +178,18 @@ MaxExtensionsReached = 139,
 LoanPrivacyRestricted = 140,
 /// Insurance pool is not connected to this loan.
 InsuranceNotLinked = 141,
-    /// Admin is not in the whitelist.
-    AdminNotWhitelisted = 143,
-    /// Admin is in the blacklist.
-    AdminBlacklisted = 144,
-    /// Governance proposal has already been approved.
-    AlreadyApproved = 145,
-    /// Loan has already been repaid.
-    AlreadyRepaid = 146,
-    /// Custom attribute not found.
-    AttributeNotFound = 147,
-    /// Bridge attestation has not been validated.
-    BridgeNotValidated = 148,
-    /// Circular voucher delegation is not allowed.
-    CircularDelegation = 149,
-    /// Co-borrower has already been added.
-    CoBorrowerAlreadyAdded = 150,
-    /// Forbearance period is not active.
-    ForbearanceNotActive = 151,
-    /// No forbearance record found.
-    ForbearanceNotFound = 152,
-    /// Dynamic rate configuration is invalid.
-    InvalidDynamicRateConfig = 153,
-    /// Operation is not valid in the current state.
-    InvalidOperation = 154,
-    /// Loan amount exceeds the maximum allowed.
-    LoanAboveMaxAmount = 155,
-    /// Loan is currently in a forbearance period.
-    LoanInForbearance = 156,
-    /// Loan not found.
-    LoanNotFound = 157,
-    /// Maximum number of co-borrowers has been exceeded.
-    MaxCoBorrowersExceeded = 158,
-    /// Maximum number of forbearance periods has been exceeded.
-    MaxForbearanceExceeded = 159,
-    /// Reentrancy was detected.
-    Reentrancy = 160,
-    /// Cannot refinance a loan with no outstanding balance.
-    RefinanceNoOutstanding = 161,
-    /// Self co-borrower is not allowed.
-    SelfCoBorrowerNotAllowed = 162,
-    /// Caller is not authorized.
-    Unauthorized = 163,
+/// No relay verification key is configured for the source chain.
+RelayKeyNotConfigured = 142,
+/// Relay chain id is zero or otherwise invalid.
+InvalidRelayChain = 143,
+/// A relay attestation reused an already-consumed nonce.
+RelayReplayDetected = 144,
+/// The relay attestation is older than the freshness window allows.
+RelayEventExpired = 145,
+/// The relay attestation is timestamped too far in the future.
+RelayEventFromFuture = 146,
+/// A relay event with this (source chain, sequence) was already processed.
+RelayEventAlreadyProcessed = 147,
+/// A relay acknowledgement tried to move the cursor backwards.
+RelayAckRegression = 148,
 }
