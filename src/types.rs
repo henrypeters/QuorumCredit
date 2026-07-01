@@ -653,6 +653,10 @@ pub enum DataKey {
     // ── API versioning ─────────────────────────────────────────────────────────
     /// Current API version string
     ApiVersion,
+    // ── Emergency admin revocation ─────────────────────────────────────────────
+    /// Emergency admin revocation record — Address → bool (true = revoked).
+    /// Revoked admins are excluded from admin approval checks.
+    RevokedAdmin(Address),
     // ── Repayment confirmation ─────────────────────────────────────────────────
     /// loan_id → bool (repayment confirmed by oracle)
     RepaymentConfirmation(u64),
@@ -1385,6 +1389,10 @@ pub struct Config {
     /// Minimum votes required to remove an admin via governance (0 = disabled).
     pub removal_vote_threshold: u32,
     /// Insurance premium rate in basis points collected at loan disbursement (e.g. 100 = 1%).
+    /// Controls where redistributable slash funds flow after insurance allocation.
+    pub redistribution_rule: RedistributionRule,
+    /// Seconds after repayment during which a borrower is immune from slash votes (0 = disabled).
+    pub immunity_period_seconds: u64,
     pub insurance_premium_bps: u32,
 }
 

@@ -69,6 +69,8 @@ mod collateral_pool_cross_chain_test;
 #[cfg(test)]
 mod property_stake_loan_invariants_test;
 #[cfg(test)]
+mod emergency_admin_revocation_test;
+#[cfg(test)]
 mod credit_score_test;
 #[cfg(test)]
 mod syndication_test;
@@ -214,8 +216,8 @@ impl QuorumCreditContract {
                 grace_period: 0,
                 min_vouch_age_secs: DEFAULT_MIN_VOUCH_AGE_SECS,
                 prepayment_penalty_bps: 0,
-                liquidity_mining_rate_bps: 0,
-                voting_period_seconds: 14 * 24 * 60 * 60, // 14 days default
+                liquidity_mining_rate_bps: DEFAULT_LIQUIDITY_MINING_RATE_BPS,
+                voting_period_seconds: DEFAULT_VOTING_PERIOD_SECONDS,
                 slash_cooldown_seconds: 0,
                 emergency_pause_enabled: false,
                 early_repayment_discount_bps: 0,
@@ -223,18 +225,20 @@ impl QuorumCreditContract {
                 slash_delay_seconds: 0,
                 successor_admin: None,
                 rate_limit_config: RateLimitConfig {
-                    window_secs: 3600,
-                    max_calls: 1000,
+                    window_secs: DEFAULT_RATE_LIMIT_WINDOW_SECS,
+                    max_calls: DEFAULT_RATE_LIMIT_COUNT,
                     enabled: false,
                 },
                 multi_tier_thresholds: None, // Issue #893: Initialize with no multi-tier thresholds
+                dynamic_slash_threshold: DEFAULT_DYNAMIC_SLASH_THRESHOLD,
+                loan_size_slash_enabled: DEFAULT_LOAN_SIZE_SLASH_ENABLED,
+                loan_size_slash_max_bps: DEFAULT_LOAN_SIZE_SLASH_MAX_BPS,
                 recovery_percentage: 0,
-                dynamic_slash_threshold: false,
-                loan_size_slash_enabled: false,
-                loan_size_slash_max_bps: 0,
-                confirmation_required: false,
                 admin_compensation_bps: 0,
                 removal_vote_threshold: 0,
+                confirmation_required: DEFAULT_CONFIRMATION_REQUIRED,
+                redistribution_rule: RedistributionRule::Treasury,
+                immunity_period_seconds: 0,
                 insurance_premium_bps: 0,
             },
         );
@@ -248,6 +252,7 @@ impl QuorumCreditContract {
     }
 
     // ── Vouching ──────────────────────────────────────────────────────────────
+
 
     pub fn vouch(
         env: Env,
@@ -1527,6 +1532,47 @@ impl QuorumCreditContract {
 
     pub fn remove_admin(env: Env, admin_signers: Vec<Address>, admin_to_remove: Address) {
         admin::remove_admin(env, admin_signers, admin_to_remove)
+    }
+
+    /// Emergency admin revocation — removes a compromised admin key with N-1 approval.
+    ///
+    /// This is an emergency mechanism: if one admin key is compromised, ALL remaining
+    /// admins (N-1 of N) can instantly revoke the compromised key. The revoked address
+    /// is permanently blacklisted from participating in admin approvals and is removed
+    /// from the active admin list.
+    ///
+    /// Unlike `remove_admin` (which uses the standard `admin_threshold`), this function
+    /// requires every non-compromised admin to sign — a stricter requirement that prevents
+    /// a single admin from unilaterally removing another.
+    ///
+    /// # Arguments
+    /// * `existing_admins` - All current admin signers excluding `target_admin` (must be N-1)
+    /// * `target_admin` - The compromised admin address to revoke
+    /// * `reason` - Human-readable reason for revocation (emitted in event)
+    ///
+    /// # Errors
+    /// * `ContractError::AdminNotFound` - `target_admin` is not a registered admin
+    /// * `ContractError::AdminAlreadyRevoked` - `target_admin` was already revoked
+    /// * `ContractError::UnauthorizedCaller` - Fewer than N-1 valid signers provided
+    /// * `ContractError::InvalidAdminThreshold` - Only 1 admin exists; cannot revoke
+    pub fn revoke_admin(
+        env: Env,
+        existing_admins: Vec<Address>,
+        target_admin: Address,
+        reason: soroban_sdk::String,
+    ) -> Result<(), ContractError> {
+        admin::revoke_admin(env, existing_admins, target_admin, reason)
+    }
+
+    /// Check whether an admin address has been emergency-revoked.
+    ///
+    /// # Arguments
+    /// * `admin` - Address to query
+    ///
+    /// # Returns
+    /// * `true` if the address has been revoked via `revoke_admin`
+    pub fn is_admin_revoked(env: Env, admin: Address) -> bool {
+        admin::is_admin_revoked(env, admin)
     }
 
     pub fn set_admin_threshold(env: Env, admin_signers: Vec<Address>, new_threshold: u32) {
