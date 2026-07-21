@@ -1,6 +1,9 @@
 extern crate alloc;
 
 use crate::errors::ContractError;
+use crate::helpers::{config, has_active_loan, require_allowed_token, require_not_paused, require_positive_amount};
+use crate::types::{DataKey, VouchRecord};
+use soroban_sdk::{symbol_short, Address, Env, Vec};
 use crate::helpers::{
     has_active_loan, require_admin_approval, require_allowed_token, require_not_paused,
     require_not_thawing, require_reads_allowed, require_positive_amount,
@@ -189,6 +192,18 @@ fn validate_vouch<'a>(
         return Err(ContractError::SelfVouchNotAllowed);
     }
 
+    // Rate limiting: enforce cooldown between vouch calls from the same address.
+    let cfg = config(env);
+    if cfg.vouch_cooldown_secs > 0 {
+        let now = env.ledger().timestamp();
+        let last: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LastVouchTimestamp(voucher.clone()))
+            .unwrap_or(0);
+        if last > 0 && now < last + cfg.vouch_cooldown_secs {
+            return Err(ContractError::VouchCooldownActive);
+        }
     if env
         .storage()
         .persistent()
