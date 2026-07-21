@@ -524,6 +524,12 @@ pub enum DataKey {
     ConfigUpdateProposalCounter,
     /// Issue #599/#600: (voucher, borrower) → WithdrawalRequest (pending timelock withdrawal)
     PendingWithdrawal(Address, Address),
+    /// Confidential vouch commitment: (voucher, borrower) → commitment record
+    VouchCommitment(Address, Address),
+    /// Monotonic counter for confidential proof records
+    ZkProofCounter,
+    /// Confidential proof record by ID
+    ZkProofRecord(u64),
     /// Issue #601: borrower → LoanExtensionRequest
     LoanExtension(Address),
     /// Issue #598: loan_id → Vec<PaymentRecord> (payment history)
@@ -1099,10 +1105,9 @@ pub struct ZkProof {
 #[contracttype]
 #[derive(Clone)]
 pub struct ConfidentialCommitment {
-    /// The commitment value (hash of blinded amount)
+    /// The commitment value (hash of the confidential amount and a prover-side blinding factor).
+    /// The blinding factor never enters on-chain storage.
     pub commitment: soroban_sdk::BytesN<32>,
-    /// The blinding factor (revealed only to trusted parties)
-    pub blinding: soroban_sdk::BytesN<32>,
 }
 
 /// Public parameters for the zk-SNARK system
