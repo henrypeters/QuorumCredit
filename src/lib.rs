@@ -10,6 +10,7 @@ pub mod rbac;
 pub mod reputation;
 pub mod types;
 pub mod vouch;
+pub mod zk_snarks;
 
 pub use errors::ContractError;
 pub use types::*;
@@ -21,8 +22,12 @@ use crate::helpers::{
     config, get_active_loan_record, has_active_loan, is_zero_address,
     loan_status as helper_loan_status, require_allowed_token, require_not_paused,
 };
-use crate::types::{AdminOperationType, Config, DataKey, DEFAULT_LOAN_DURATION, DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, DEFAULT_MIN_VOUCH_AGE_SECS};
-use soroban_sdk::BytesN;
+use crate::types::{
+    AdminOperationType, Config, ConfidentialCommitment, DataKey, DEFAULT_LOAN_DURATION,
+    DEFAULT_MAX_LOAN_TO_STAKE_RATIO, DEFAULT_MAX_VOUCHERS, DEFAULT_MIN_LOAN_AMOUNT,
+    DEFAULT_MIN_VOUCH_AGE_SECS, DEFAULT_SLASH_BPS, DEFAULT_YIELD_BPS, ZkProof,
+};
+use soroban_sdk::{BytesN, Vec};
 
 #[contract]
 pub struct QuorumCreditContract;
@@ -253,8 +258,8 @@ impl QuorumCreditContract {
         token: Address,
         chain_id: Option<u32>,
     ) -> Result<(), ContractError> {
-        // Verify the zk-SNARK proof
-        zk_snarks::verify_vouch_proof(&env, &proof, &voucher, &borrower, 0)?;
+        // Verify the zk-SNARK proof against the provided proof context.
+        zk_snarks::verify_vouch_proof(&env, &proof, &voucher, &borrower, &token, 0, true, false)?;
 
         // Store the commitment for this vouch
         env.storage()
@@ -442,8 +447,8 @@ impl QuorumCreditContract {
         loan_purpose: soroban_sdk::String,
         token: Address,
     ) -> Result<(), ContractError> {
-        // Verify the zk-SNARK proof
-        zk_snarks::verify_loan_proof(&env, &proof, &borrower, 0, threshold)?;
+        // Verify the zk-SNARK proof against the provided loan context.
+        zk_snarks::verify_loan_proof(&env, &proof, &borrower, &token, 0, threshold, true, false)?;
 
         // Record the proof for audit trail
         let proof_id: u64 = env
@@ -543,7 +548,7 @@ impl QuorumCreditContract {
         }
 
         // Issue #882: Route portion of slashed funds to insurance pool
-        insurance::allocate_slash_to_pool(&env, total_slashed);
+        crate::allocate_slash_to_pool(&env, total_slashed);
         helpers::add_slash_balance(&env, total_slashed);
 
         let count: u32 = env
@@ -803,7 +808,7 @@ impl QuorumCreditContract {
         }
 
         // Issue #882: Route portion of slashed funds to insurance pool
-        insurance::allocate_slash_to_pool(&env, total_slash);
+        crate::allocate_slash_to_pool(&env, total_slash);
         helpers::add_slash_balance(&env, total_slash);
 
         let count: u32 = env
@@ -1058,7 +1063,7 @@ impl QuorumCreditContract {
         target_pool_id: u64,
         amount: i128,
     ) -> Result<(), ContractError> {
-        liquidity_rebalance::rebalance_pools(env, admin_signers, source_pool_id, target_pool_id, amount)
+        crate::rebalance_pools(env, admin_signers, source_pool_id, target_pool_id, amount)
     }
 
     /// Automatically rebalance all inactive collateral pools toward `target_stake`.
@@ -1068,12 +1073,12 @@ impl QuorumCreditContract {
         admin_signers: Vec<Address>,
         target_stake: i128,
     ) -> Result<u32, ContractError> {
-        liquidity_rebalance::auto_rebalance_pools(env, admin_signers, target_stake)
+        crate::auto_rebalance_pools(env, admin_signers, target_stake)
     }
 
     /// Return total stake held in a collateral pool.
     pub fn get_pool_liquidity(env: Env, pool_id: u64) -> Result<i128, ContractError> {
-        liquidity_rebalance::get_pool_liquidity(env, pool_id)
+        crate::get_pool_liquidity(env, pool_id)
     }
 
     // ── Admin ─────────────────────────────────────────────────────────────────
@@ -2088,7 +2093,7 @@ impl QuorumCreditContract {
         source_chain: u32,
         public_key: BytesN<32>,
     ) -> Result<(), ContractError> {
-        cross_chain_relay::set_relay_key(env, admin_signers, source_chain, public_key)
+        crate::set_relay_key(env, admin_signers, source_chain, public_key)
     }
 
     /// Enqueue an outbound relay event for `dest_chain`, returning its sequence.
@@ -2099,7 +2104,7 @@ impl QuorumCreditContract {
         event_type: soroban_sdk::Symbol,
         payload: soroban_sdk::Bytes,
     ) -> Result<u64, ContractError> {
-        cross_chain_relay::relay_emit(env, admin_signers, dest_chain, event_type, payload)
+        crate::relay_emit(env, admin_signers, dest_chain, event_type, payload)
     }
 
     /// Canonical bytes the source chain's relay key must sign for an event.
@@ -2109,7 +2114,7 @@ impl QuorumCreditContract {
         nonce: u64,
         timestamp: u64,
     ) -> soroban_sdk::Bytes {
-        cross_chain_relay::relay_attestation_message(&env, &event, nonce, timestamp)
+        crate::relay_attestation_message(&env, &event, nonce, timestamp)
     }
 
     /// Verify and consume an inbound relayed event (idempotent per source+seq).
@@ -2118,7 +2123,7 @@ impl QuorumCreditContract {
         event: RelayEvent,
         attestation: RelayAttestation,
     ) -> Result<(), ContractError> {
-        cross_chain_relay::relay_message(env, event, attestation)
+        crate::relay_message(env, event, attestation)
     }
 
     /// Acknowledge outbound delivery up to `up_to_seq` for `dest_chain`.
@@ -2128,77 +2133,77 @@ impl QuorumCreditContract {
         dest_chain: u32,
         up_to_seq: u64,
     ) -> Result<(), ContractError> {
-        cross_chain_relay::acknowledge_relay(env, admin_signers, dest_chain, up_to_seq)
+        crate::acknowledge_relay(env, admin_signers, dest_chain, up_to_seq)
     }
 
     pub fn get_outbound_relay_event(env: Env, dest_chain: u32, seq: u64) -> Option<RelayEvent> {
-        cross_chain_relay::get_outbound_event(env, dest_chain, seq)
+        crate::get_outbound_event(env, dest_chain, seq)
     }
 
     pub fn latest_outbound_relay_seq(env: Env, dest_chain: u32) -> u64 {
-        cross_chain_relay::latest_outbound_seq(env, dest_chain)
+        crate::latest_outbound_seq(env, dest_chain)
     }
 
     pub fn last_acknowledged_relay_seq(env: Env, dest_chain: u32) -> u64 {
-        cross_chain_relay::last_acknowledged_seq(env, dest_chain)
+        crate::last_acknowledged_seq(env, dest_chain)
     }
 
     pub fn is_relay_processed(env: Env, source_chain: u32, seq: u64) -> bool {
-        cross_chain_relay::is_relay_processed(env, source_chain, seq)
+        crate::is_relay_processed(env, source_chain, seq)
     }
 
     pub fn is_relay_nonce_used(env: Env, source_chain: u32, nonce: u64) -> bool {
-        cross_chain_relay::is_relay_nonce_used(env, source_chain, nonce)
+        crate::is_relay_nonce_used(env, source_chain, nonce)
     }
 
     // ── Custom Attributes ────────────────────────────────────────────────────
 
     pub fn set_attribute(env: Env, caller: Address, key: soroban_sdk::String, value: soroban_sdk::String) -> Result<(), ContractError> {
-        attributes::set_attribute(env, caller, key, value)
+        crate::set_attribute(env, caller, key, value)
     }
 
     pub fn get_attributes(env: Env, caller: Address) -> Vec<AttributeEntry> {
-        attributes::get_attributes(env, caller)
+        crate::get_attributes(env, caller)
     }
 
     pub fn remove_attribute(env: Env, caller: Address, key: soroban_sdk::String) -> Result<(), ContractError> {
-        attributes::remove_attribute(env, caller, key)
+        crate::remove_attribute(env, caller, key)
     }
 
     // ── Yield Stream ─────────────────────────────────────────────────────────
 
     pub fn claim_streamed_yield(env: Env, voucher: Address, loan_id: u64) -> Result<i128, ContractError> {
-        yield_stream::claim_streamed_yield(env, voucher, loan_id)
+        crate::claim_streamed_yield(env, voucher, loan_id)
     }
 
     pub fn get_yield_stream_state(env: Env, loan_id: u64) -> Option<YieldStreamState> {
-        yield_stream::get_yield_stream_state(env, loan_id)
+        crate::get_yield_stream_state(env, loan_id)
     }
 
     pub fn get_voucher_yield_claim(env: Env, loan_id: u64, voucher: Address) -> Option<VoucherYieldClaim> {
-        yield_stream::get_voucher_yield_claim(env, loan_id, voucher)
+        crate::get_voucher_yield_claim(env, loan_id, voucher)
     }
 
     // ── Vouch Groups ─────────────────────────────────────────────────────────
 
     pub fn create_vouch_group(env: Env, caller: Address, name: soroban_sdk::String) -> Result<u64, ContractError> {
-        vouch_groups::create_vouch_group(env, caller, name)
+        crate::create_vouch_group(env, caller, name)
     }
 
     pub fn add_voucher_to_group(env: Env, caller: Address, group_id: u64, voucher: Address) -> Result<(), ContractError> {
-        vouch_groups::add_voucher_to_group(env, caller, group_id, voucher)
+        crate::add_voucher_to_group(env, caller, group_id, voucher)
     }
 
     pub fn remove_voucher_from_group(env: Env, caller: Address, group_id: u64, voucher: Address) -> Result<(), ContractError> {
-        vouch_groups::remove_voucher_from_group(env, caller, group_id, voucher)
+        crate::remove_voucher_from_group(env, caller, group_id, voucher)
     }
 
     pub fn get_vouch_group(env: Env, group_id: u64) -> Option<VouchGroup> {
-        vouch_groups::get_vouch_group(env, group_id)
+        crate::get_vouch_group(env, group_id)
     }
 
     pub fn get_voucher_group_ids(env: Env, voucher: Address) -> Vec<u64> {
-        vouch_groups::get_voucher_group_ids(env, voucher)
+        crate::get_voucher_group_ids(env, voucher)
     }
 
     // ── Periodic Payments ────────────────────────────────────────────────────
@@ -2211,19 +2216,19 @@ impl QuorumCreditContract {
         period_count: u32,
         period_interest_bps: u32,
     ) -> Result<(), ContractError> {
-        periodic_payments::set_periodic_payment(env, caller, loan_id, schedule_type, period_count, period_interest_bps)
+        crate::set_periodic_payment(env, caller, loan_id, schedule_type, period_count, period_interest_bps)
     }
 
     pub fn make_periodic_payment(env: Env, borrower: Address, loan_id: u64, payment: i128) -> Result<(), ContractError> {
-        periodic_payments::make_periodic_payment(env, borrower, loan_id, payment)
+        crate::make_periodic_payment(env, borrower, loan_id, payment)
     }
 
     pub fn get_periodic_payment_config(env: Env, loan_id: u64) -> Option<PeriodicPaymentConfig> {
-        periodic_payments::get_periodic_payment_config(env, loan_id)
+        crate::get_periodic_payment_config(env, loan_id)
     }
 
     pub fn get_periodic_payment_status(env: Env, loan_id: u64) -> Option<PeriodicPaymentStatus> {
-        periodic_payments::get_periodic_payment_status(env, loan_id)
+        crate::get_periodic_payment_status(env, loan_id)
     }
 
     // ── Issue #883: Loan Term Extension ─────────────────────────────────────
@@ -2255,7 +2260,7 @@ impl QuorumCreditContract {
         contributor: Address,
         amount: i128,
     ) -> Result<(), ContractError> {
-        insurance::contribute_to_insurance(env, contributor, amount)
+        crate::contribute_to_insurance(env, contributor, amount)
     }
 
     pub fn claim_insurance(
@@ -2263,7 +2268,7 @@ impl QuorumCreditContract {
         voucher: Address,
         loan_id: u64,
     ) -> Result<(), ContractError> {
-        insurance::claim_insurance(env, voucher, loan_id)
+        crate::claim_insurance(env, voucher, loan_id)
     }
 
     pub fn purchase_slash_insurance(
@@ -2271,15 +2276,15 @@ impl QuorumCreditContract {
         voucher: Address,
         borrower: Address,
     ) -> Result<i128, ContractError> {
-        insurance::purchase_slash_insurance(env, voucher, borrower)
+        crate::purchase_slash_insurance(env, voucher, borrower)
     }
 
     pub fn is_voucher_insured(env: Env, voucher: Address, borrower: Address) -> bool {
-        insurance::is_voucher_insured(env, voucher, borrower)
+        crate::is_voucher_insured(env, voucher, borrower)
     }
 
     pub fn get_insurance_pool_balance(env: Env) -> i128 {
-        insurance::get_insurance_pool_balance(env)
+        crate::get_insurance_pool_balance(env)
     }
 
     pub fn set_insurance_fee_bps(
@@ -2287,7 +2292,7 @@ impl QuorumCreditContract {
         admin_signers: Vec<Address>,
         fee_bps: u32,
     ) -> Result<(), ContractError> {
-        insurance::set_insurance_fee_bps(env, admin_signers, fee_bps)
+        crate::set_insurance_fee_bps(env, admin_signers, fee_bps)
     }
 
     pub fn set_insurance_coverage_bps(
@@ -2295,15 +2300,15 @@ impl QuorumCreditContract {
         admin_signers: Vec<Address>,
         coverage_bps: u32,
     ) -> Result<(), ContractError> {
-        insurance::set_insurance_coverage_bps(env, admin_signers, coverage_bps)
+        crate::set_insurance_coverage_bps(env, admin_signers, coverage_bps)
     }
 
     pub fn get_insurance_fee_bps(env: Env) -> u32 {
-        insurance::get_insurance_fee_bps_pub(env)
+        crate::get_insurance_fee_bps_pub(env)
     }
 
     pub fn get_insurance_coverage_bps(env: Env) -> u32 {
-        insurance::get_insurance_coverage_bps_pub(env)
+        crate::get_insurance_coverage_bps_pub(env)
     }
 
     // ── Issue #884: Prepayment Bonus ────────────────────────────────────────
